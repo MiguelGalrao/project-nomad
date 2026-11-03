@@ -91,6 +91,10 @@ export const customAppValidator = vine.compile(
     // Optional resource caps (advanced). Default caps are applied when omitted.
     memory_mb: vine.number().min(64).optional(),
     cpus: vine.number().min(0.1).max(64).optional(),
+    // Opt-in GPU passthrough (#1447). A boolean only: the device config itself is chosen by
+    // DockerService from the detected GPU, and vine strips any raw HostConfig/DeviceRequests
+    // keys a client might send, so users can never hand NOMAD arbitrary device config.
+    gpu: vine.boolean().optional(),
     // When true, bypass advisory preflight (port conflicts / guard warnings) and install anyway.
     force: vine.boolean().optional(),
   })
@@ -208,6 +212,8 @@ export const updateCustomAppValidator = vine.compile(
     icon: vine.string().trim().optional(),
     memory_mb: vine.number().min(64).optional(),
     cpus: vine.number().min(0.1).max(64).optional(),
+    // Opt-in GPU passthrough (#1447); omitted leaves the app's current setting unchanged.
+    gpu: vine.boolean().optional(),
     force: vine.boolean().optional(),
   })
 )

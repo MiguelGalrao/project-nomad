@@ -33,6 +33,7 @@ import {
   DEFAULT_MEMORY_MB,
   evaluateCustomApp,
 } from '#services/custom_app_guard'
+import { customAppWantsGpu, setCustomAppGpuFlag } from '../utils/gpu_passthrough.js'
 import { DEFAULT_LINK_TILE_ICON, isLinkTileIcon } from '../../constants/link_tile_icons.js'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
@@ -365,6 +366,24 @@ export default class SystemController {
             portConflicts,
             resourceWarnings: [...resourceWarnings, ...guard.warnings],
             blocked: guard.blocked,
+        })
+    }
+
+    /**
+     * GPU availability for the custom-app form's "Use GPU" switch (#1447): the detected GPU type
+     * (what the install path will act on) plus, when the AI Assistant is running on the GPU, the
+     * VRAM it reported, so the form can warn that a GPU app competes with it for that memory.
+     */
+    async customAppGpuInfo({ response }: HttpContext) {
+        const [gpu, ollamaGpu] = await Promise.all([
+            this.dockerService.detectGPUType(),
+            this.systemService.getOllamaInferenceComputeFromLogs(),
+        ])
+        return response.send({
+            type: gpu.type,
+            toolkitMissing: gpu.toolkitMissing ?? false,
+            vramMiB: ollamaGpu?.vramMiB ?? null,
+            gpuName: ollamaGpu?.name ?? null,
         })
     }
 
@@ -768,13 +787,14 @@ export default class SystemController {
 
         // Merge the form fields into the app's existing config rather than rebuilding from scratch,
         // so advanced settings a curated app ships with (GPU device requests, special env, etc.) are
-        // preserved across an edit.
+        // preserved across an edit. The GPU opt-in (#1447) only applies to custom apps: curated
+        // apps that use a GPU (the AI Assistant) configure it themselves.
         // Preserve an explicit scheme (e.g. ui_location "https:8480") across an edit — otherwise a
         // TLS-serving app's Open link would silently revert to http after any reconfigure.
         const prevScheme = (service.ui_location || '').match(/^(https?):\d+$/)?.[1]
         const { containerConfig, uiLocation } = this.mergeCustomContainerConfig(
             service.container_config,
-            payload
+            service.is_custom ? payload : { ...payload, gpu: undefined }
         )
         service.friendly_name = payload.friendly_name
         service.container_image = payload.image
@@ -805,6 +825,7 @@ export default class SystemController {
         env?: string[]
         memory_mb?: number
         cpus?: number
+        gpu?: boolean
     }): { containerConfig: Record<string, any>; uiLocation: string | null } {
         const portBindings: Record<string, [{ HostPort: string }]> = {}
         const exposedPorts: Record<string, {}> = {}
@@ -833,6 +854,8 @@ export default class SystemController {
             ExposedPorts: exposedPorts,
             ...(payload.env?.length ? { Env: payload.env } : {}),
         }
+        // Only the opt-in is stored; the device config is resolved at container creation (#1447).
+        setCustomAppGpuFlag(containerConfig, payload.gpu === true)
 
         const firstHostPort = payload.ports?.[0]?.host
         const uiLocation = firstHostPort ? String(firstHostPort) : null
@@ -854,6 +877,7 @@ export default class SystemController {
             env?: string[]
             memory_mb?: number
             cpus?: number
+            gpu?: boolean
         }
     ): { containerConfig: Record<string, any>; uiLocation: string | null } {
         const parsed = existingRaw
@@ -893,6 +917,8 @@ export default class SystemController {
         if (payload.cpus != null) {
             containerConfig.HostConfig.NanoCpus = Math.round(payload.cpus * 1e9)
         }
+        // Like resource caps: an omitted flag keeps the app's current GPU setting.
+        if (payload.gpu !== undefined) setCustomAppGpuFlag(containerConfig, payload.gpu)
 
         const firstHostPort = payload.ports?.[0]?.host
         const uiLocation = firstHostPort ? String(firstHostPort) : null
@@ -926,6 +952,8 @@ export default class SystemController {
             env: (config?.Env ?? []) as string[],
             memory_mb: hostConfig.Memory ? Math.round(hostConfig.Memory / (1024 * 1024)) : undefined,
             cpus: hostConfig.NanoCpus ? hostConfig.NanoCpus / 1e9 : undefined,
+            is_custom: !!service.is_custom,
+            gpu: customAppWantsGpu(config),
         }
     }
 }

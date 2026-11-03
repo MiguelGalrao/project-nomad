@@ -1268,6 +1268,18 @@ class API {
     })()
   }
 
+  async getCustomAppGpuInfo() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{
+        type: 'nvidia' | 'amd' | 'none'
+        toolkitMissing: boolean
+        vramMiB: number | null
+        gpuName: string | null
+      }>('/system/services/custom-gpu')
+      return response.data
+    })()
+  }
+
   async preflightCustomApp(payload: {
     image?: string
     ports?: number[]
@@ -1294,6 +1306,7 @@ class API {
     icon?: string
     memory_mb?: number
     cpus?: number
+    gpu?: boolean
     force?: boolean
   }) {
     return catchInternal(async () => {
@@ -1387,6 +1400,8 @@ class API {
           env: string[]
           memory_mb?: number
           cpus?: number
+          is_custom: boolean
+          gpu: boolean
         }
       }>(`/system/services/custom/${service_name}`)
       return response.data
@@ -1404,6 +1419,7 @@ class API {
     icon?: string
     memory_mb?: number
     cpus?: number
+    gpu?: boolean
     force?: boolean
   }) {
     return catchInternal(async () => {

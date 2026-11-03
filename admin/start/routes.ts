@@ -574,6 +574,10 @@ router
       summary: 'Suggest an available custom port',
       tags: ['system'],
     })
+    documented(router.get('/services/custom-gpu', [SystemController, 'customAppGpuInfo']), {
+      summary: 'Get GPU availability for custom apps',
+      tags: ['system'],
+    })
     documented(router.post('/services/preflight-custom', [SystemController, 'preflightCustomApp']), {
       summary: 'Preflight a custom app install',
       tags: ['system'],

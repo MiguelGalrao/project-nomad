@@ -5,6 +5,7 @@ import Alert from './Alert'
 import api from '~/lib/api'
 import Input from './inputs/Input'
 import Select from './inputs/Select'
+import Switch from './inputs/Switch'
 import DynamicIcon, { DynamicIconName } from './DynamicIcon'
 import { IconTrash } from '@tabler/icons-react'
 
@@ -33,6 +34,16 @@ export interface CustomAppInitial {
   env: string[]
   memory_mb?: number
   cpus?: number
+  /** Curated apps are editable here too; the GPU opt-in (#1447) only applies to custom apps. */
+  is_custom?: boolean
+  gpu?: boolean
+}
+
+interface GpuInfo {
+  type: 'nvidia' | 'amd' | 'none'
+  toolkitMissing: boolean
+  vramMiB: number | null
+  gpuName: string | null
 }
 
 interface CustomAppModalProps {
@@ -100,6 +111,17 @@ export default function CustomAppModal({
   const [forceInstall, setForceInstall] = useState(false)
   const [checkingPreflight, setCheckingPreflight] = useState(false)
   const [suggestedPort, setSuggestedPort] = useState<number | null>(null)
+  const [useGpu, setUseGpu] = useState(false)
+  // undefined = still checking, null = the check failed.
+  const [gpuInfo, setGpuInfo] = useState<GpuInfo | null | undefined>(undefined)
+  const showGpu = !isEdit || !!initial?.is_custom
+
+  // GPU detection for the "Use GPU" switch: disabled with a hint when there's nothing to pass through.
+  useEffect(() => {
+    if (!open || !showGpu) return
+    setGpuInfo(undefined)
+    api.getCustomAppGpuInfo().then((res) => setGpuInfo(res ?? null))
+  }, [open, showGpu])
 
   // On open: prefill from the existing app (edit) or fetch a suggested port (create).
   useEffect(() => {
@@ -118,6 +140,7 @@ export default function CustomAppModal({
       setEnvVars(initial.env.map((v) => ({ value: v })))
       setMemoryMb(initial.memory_mb != null ? String(initial.memory_mb) : '')
       setCpus(initial.cpus != null ? String(initial.cpus) : '')
+      setUseGpu(!!initial.gpu)
       return
     }
     api.suggestCustomPort().then((res) => {
@@ -179,6 +202,8 @@ export default function CustomAppModal({
     setBlocked([])
     setForceInstall(false)
     setSuggestedPort(null)
+    setUseGpu(false)
+    setGpuInfo(undefined)
   }
 
   function handleClose() {
@@ -253,6 +278,8 @@ export default function CustomAppModal({
         icon,
         memory_mb: !isNaN(parsedMemory) ? parsedMemory : undefined,
         cpus: !isNaN(parsedCpus) ? parsedCpus : undefined,
+        // Omitted for curated apps so an edit leaves their own GPU config alone.
+        gpu: showGpu ? useGpu : undefined,
         // The user has already acknowledged any conflicts via the "install anyway" checkbox.
         force: forceInstall,
       }
@@ -280,6 +307,27 @@ export default function CustomAppModal({
   }
 
   const hasWarnings = portConflicts.length > 0 || resourceWarnings.length > 0
+
+  const gpuAvailable = gpuInfo?.type === 'nvidia' || gpuInfo?.type === 'amd'
+  // Still allow switching an already-enabled app off when the GPU has since disappeared.
+  const gpuSwitchDisabled = !gpuAvailable && !useGpu
+  let gpuDescription: string
+  if (gpuInfo === undefined) {
+    gpuDescription = 'Checking for a GPU…'
+  } else if (gpuAvailable) {
+    gpuDescription = `Pass the host's ${gpuInfo!.type === 'nvidia' ? 'NVIDIA' : 'AMD'} GPU through to this app, the same way the AI Assistant uses it. The image must include its own GPU libraries (e.g. CUDA or ROCm).`
+  } else if (gpuInfo?.toolkitMissing) {
+    gpuDescription =
+      'An NVIDIA GPU was found, but the NVIDIA Container Toolkit is not installed, so it cannot be shared with apps.'
+  } else if (gpuInfo === null) {
+    gpuDescription = 'Could not check for a GPU on this system.'
+  } else {
+    gpuDescription = 'No GPU detected on this system.'
+  }
+  const vramText =
+    gpuInfo?.vramMiB != null
+      ? `${gpuInfo.gpuName ? `the ${gpuInfo.gpuName}'s ` : ''}${(gpuInfo.vramMiB / 1024).toFixed(1)} GB of VRAM`
+      : 'GPU memory (VRAM)'
   const hasBlocks = blocked.length > 0
   const canSubmit =
     friendlyName.trim() && image.trim() && !hasBlocks && (!hasWarnings || forceInstall)
@@ -495,6 +543,30 @@ export default function CustomAppModal({
           </div>
           <p className="text-xs mt-1 italic">Caps prevent a runaway container from starving the host. Leave blank to use the defaults (1024 MB / 1 CPU).</p>
         </div>
+
+        {/* GPU access (#1447): opt-in, custom apps only */}
+        {showGpu && (
+          <div>
+            <Switch
+              id="customAppGpu"
+              label="Use GPU"
+              description={gpuDescription}
+              checked={useGpu}
+              onChange={setUseGpu}
+              disabled={gpuSwitchDisabled}
+            />
+            {/* A warning, not a block: on a small card a GPU app can push the AI Assistant's
+                model layers back to the CPU with no error at all, just a much slower reply. */}
+            {useGpu && (
+              <Alert
+                type="warning"
+                title="Shares the GPU with the AI Assistant"
+                message={`This app will share ${vramText} with the AI Assistant. When both use the GPU at once, the AI Assistant may quietly fall back to the CPU and respond much more slowly, and either app may hit out-of-memory errors.`}
+                className="mt-2"
+              />
+            )}
+          </div>
+        )}
 
         {/* Hard blocks — must be resolved before installing */}
         {hasBlocks && (

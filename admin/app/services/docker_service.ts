@@ -5,6 +5,12 @@ import { inject } from '@adonisjs/core'
 import transmit from '@adonisjs/transmit/services/main'
 import { doResumableDownloadWithRetry } from '../utils/downloads.js'
 import { pickAmdHsaOverride } from '../utils/amd_hsa_override.js'
+import {
+  amdGpuDevices,
+  applyGpuHostConfig,
+  customAppWantsGpu,
+  nvidiaDeviceRequests,
+} from '../utils/gpu_passthrough.js'
 import { join } from 'path'
 import os from 'node:os'
 import env from '#start/env'
@@ -749,16 +755,7 @@ export class DockerService {
           )
 
           // Add GPU support for NVIDIA
-          gpuHostConfig = {
-            ...gpuHostConfig,
-            DeviceRequests: [
-              {
-                Driver: 'nvidia',
-                Count: -1, // -1 means all GPUs
-                Capabilities: [['gpu']],
-              },
-            ],
-          }
+          gpuHostConfig = applyGpuHostConfig(gpuHostConfig, 'nvidia')
         } else if (gpuResult.type === 'amd') {
           // AMD acceleration is opt-out via the 'ai.amdGpuAcceleration' KV key (default-on).
           // Per memory feedback: KV values can be string or boolean — coerce explicitly.
@@ -787,14 +784,10 @@ export class DockerService {
               await this.pullImage(finalImage)
             }
 
-            const amdDevices = await this._discoverAMDDevices()
-            gpuHostConfig = {
-              ...gpuHostConfig,
-              Devices: amdDevices,
-            }
+            gpuHostConfig = applyGpuHostConfig(gpuHostConfig, 'amd')
             amdGpuConfigured = true
             logger.info(
-              `[DockerService] Configured ROCm image and ${amdDevices.length} AMD device entries for Ollama`
+              `[DockerService] Configured ROCm image and ${gpuHostConfig.Devices?.length ?? 0} AMD device entries for Ollama`
             )
           } else {
             this._broadcast(
@@ -817,6 +810,15 @@ export class DockerService {
             `No GPU detected. Using CPU-only configuration...`
           )
         }
+      } else if (service.is_custom && customAppWantsGpu(containerConfig)) {
+        // Opt-in GPU access for a custom app (#1447). Same device config as Ollama, but the
+        // image is the user's, so there is no ROCm image swap and no Ollama-specific env.
+        const gpuHostResult = await this._resolveCustomAppGpuHostConfig(
+          service.service_name,
+          gpuHostConfig
+        )
+        gpuHostConfig = gpuHostResult.hostConfig
+        amdGpuConfigured = gpuHostResult.amdGpuConfigured
       }
 
       const ollamaEnv: string[] = []
@@ -931,7 +933,9 @@ export class DockerService {
           'gpu-config',
           `AMD GPU detected, but this system has no usable ROCm device (/dev/kfd is missing, ` +
             `which means the amdgpu/ROCm kernel driver is not loaded or does not support this GPU). ` +
-            `Installing CPU-only instead so the AI Assistant still works.`
+            (service.is_custom
+              ? `Installing ${service.friendly_name || service.service_name} without GPU access instead.`
+              : `Installing CPU-only instead so the AI Assistant still works.`)
         )
 
         // The created container carries the rejected device config, so it cannot be
@@ -1462,6 +1466,58 @@ export class DockerService {
   }
 
   /**
+   * GPU detection for the custom-app form (#1447), so the "Use GPU" switch can be disabled when
+   * there is nothing to pass through. Same answer the install path will act on.
+   */
+  async detectGPUType(): Promise<{ type: 'nvidia' | 'amd' | 'none'; toolkitMissing?: boolean }> {
+    return this._detectGPUType()
+  }
+
+  /**
+   * Resolve the HostConfig for a custom app that opted into GPU access (#1447).
+   *
+   * Reuses the Ollama device config via applyGpuHostConfig. A missing GPU never fails the
+   * install: the app is created without GPU access and the reason is broadcast, matching how
+   * the AI Assistant degrades to CPU-only. `amdGpuConfigured` lets the caller fall back when
+   * the daemon rejects /dev/kfd at start time (#1232).
+   */
+  private async _resolveCustomAppGpuHostConfig(
+    serviceName: string,
+    hostConfig: Record<string, any>
+  ): Promise<{ hostConfig: Record<string, any>; amdGpuConfigured: boolean }> {
+    const gpuResult = await this._detectGPUType()
+    if (gpuResult.type === 'nvidia') {
+      this._broadcast(
+        serviceName,
+        'gpu-config',
+        `NVIDIA GPU detected. Giving this app GPU access...`
+      )
+    } else if (gpuResult.type === 'amd') {
+      this._broadcast(
+        serviceName,
+        'gpu-config',
+        `AMD GPU detected. Giving this app GPU access via /dev/kfd and /dev/dri passthrough...`
+      )
+    } else if (gpuResult.toolkitMissing) {
+      this._broadcast(
+        serviceName,
+        'gpu-config',
+        `GPU access was requested, but the NVIDIA Container Toolkit is not installed. Creating the app without GPU access. Install the toolkit and save the app again to enable it: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html`
+      )
+    } else {
+      this._broadcast(
+        serviceName,
+        'gpu-config',
+        `GPU access was requested, but no GPU was detected. Creating the app without GPU access.`
+      )
+    }
+    return {
+      hostConfig: applyGpuHostConfig(hostConfig, gpuResult.type),
+      amdGpuConfigured: gpuResult.type === 'amd',
+    }
+  }
+
+  /**
    * Detect GPU type and toolkit availability.
    * Primary: Check Docker runtimes via docker.info() (works from inside containers).
    * Secondary: Read /app/storage/.nomad-gpu-type written by install_nomad.sh — needed
@@ -1689,25 +1745,6 @@ export class DockerService {
   }
 
   /**
-   * Build the Docker Devices array for AMD GPU passthrough.
-   *
-   * Returns /dev/kfd (Kernel Fusion Driver, required by ROCm) and /dev/dri (the DRM
-   * device tree). Passing /dev/dri as a single directory entry mirrors Docker CLI
-   * --device behavior — the daemon expands it to all child devices (card*, renderD*)
-   * regardless of how the host enumerates them. This avoids the brittle hardcoded
-   * fallback (card0/renderD128) the prior implementation used, which was wrong on
-   * systems where the AMD GPU enumerates as card1+ (e.g. UM890 Pro 780M iGPU).
-   */
-  private async _discoverAMDDevices(): Promise<
-    Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }>
-  > {
-    return [
-      { PathOnHost: '/dev/kfd', PathInContainer: '/dev/kfd', CgroupPermissions: 'rwm' },
-      { PathOnHost: '/dev/dri', PathInContainer: '/dev/dri', CgroupPermissions: 'rwm' },
-    ]
-  }
-
-  /**
    * Whether a container-create failure was the daemon refusing a `--device` path
    * that does not exist on the host, e.g.
    *
@@ -1788,9 +1825,7 @@ export class DockerService {
             'update-gpu-config',
             `NVIDIA container runtime detected. Configuring updated container with GPU support...`
           )
-          updatedDeviceRequests = [
-            { Driver: 'nvidia', Count: -1, Capabilities: [['gpu']] },
-          ]
+          updatedDeviceRequests = nvidiaDeviceRequests()
         } else if (gpuResult.type === 'amd') {
           const amdEnabledRaw = await KVStore.getValue('ai.amdGpuAcceleration')
           const amdAccelerationEnabled = String(amdEnabledRaw) !== 'false'
@@ -1801,7 +1836,7 @@ export class DockerService {
               `AMD GPU detected. Using ROCm image with /dev/kfd and /dev/dri passthrough...`
             )
             runtimeImage = 'ollama/ollama:rocm'
-            updatedAmdDevices = await this._discoverAMDDevices()
+            updatedAmdDevices = amdGpuDevices()
             updatedAmdGpuConfigured = true
           } else {
             this._broadcast(
@@ -2367,7 +2402,18 @@ export class DockerService {
         recreateEnv = [...recreateEnv, `HBOX_AUTH_API_KEY_PEPPER=${await this._resolveHomeboxPepper()}`]
       }
 
-      const newContainer = await this.docker.createContainer({
+      // Opt-in GPU access (#1447) is re-resolved on every recreate rather than stored as device
+      // config, so an edit or image update keeps it, and picks up a GPU or toolkit that was
+      // added since the app was first installed.
+      let hostConfig: Record<string, any> = containerConfig?.HostConfig ?? {}
+      let amdGpuConfigured = false
+      if (service.is_custom && customAppWantsGpu(containerConfig)) {
+        const gpuHostResult = await this._resolveCustomAppGpuHostConfig(serviceName, hostConfig)
+        hostConfig = gpuHostResult.hostConfig
+        amdGpuConfigured = gpuHostResult.amdGpuConfigured
+      }
+
+      const buildCreateOptions = (hc: Record<string, any>) => ({
         Image: service.container_image,
         name: serviceName,
         Labels: {
@@ -2376,7 +2422,7 @@ export class DockerService {
           'io.project-nomad.managed': 'true',
         },
         ...(containerConfig?.User && { User: containerConfig.User }),
-        HostConfig: containerConfig?.HostConfig ?? {},
+        HostConfig: hc,
         ...(containerConfig?.ExposedPorts && { ExposedPorts: containerConfig.ExposedPorts }),
         ...(recreateEnv.length ? { Env: recreateEnv } : {}),
         ...(service.container_command ? { Cmd: service.container_command.split(' ') } : {}),
@@ -2384,7 +2430,29 @@ export class DockerService {
           NetworkingConfig: { EndpointsConfig: { [DockerService.NOMAD_NETWORK]: {} } },
         }),
       })
-      await newContainer.start()
+
+      let newContainer = await this.docker.createContainer(buildCreateOptions(hostConfig))
+      try {
+        await newContainer.start()
+      } catch (error: any) {
+        // Same #1232 fallback as the install path: an AMD box with no /dev/kfd only fails at
+        // start(). Drop the devices and carry on without GPU rather than rolling the edit back.
+        if (!amdGpuConfigured || !this._isMissingDeviceError(error)) throw error
+        logger.warn(
+          `[DockerService] AMD device passthrough rejected by the daemon (${error?.message}); ` +
+            `recreating ${serviceName} without GPU access`
+        )
+        this._broadcast(
+          serviceName,
+          'gpu-config',
+          `AMD GPU detected, but this system has no usable ROCm device (/dev/kfd is missing). ` +
+            `Recreating the app without GPU access instead.`
+        )
+        await newContainer.remove({ force: true }).catch(() => {})
+        const { Devices, ...cpuHostConfig } = hostConfig
+        newContainer = await this.docker.createContainer(buildCreateOptions(cpuHostConfig))
+        await newContainer.start()
+      }
 
       // Health gate before discarding the old container.
       const readiness = await this._awaitContainerReady(newContainer)
