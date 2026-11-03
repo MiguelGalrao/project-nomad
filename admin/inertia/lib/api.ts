@@ -85,11 +85,18 @@ class API {
     })()
   }
 
-  async configureRemoteOllama(remoteUrl: string | null): Promise<{ success: boolean; message: string }> {
+  /**
+   * `apiKey`: omit (undefined) to keep the saved key, '' to remove it, or a new key
+   * to replace it. The saved key is never sent back to the browser.
+   */
+  async configureRemoteOllama(
+    remoteUrl: string | null,
+    apiKey?: string
+  ): Promise<{ success: boolean; message: string }> {
     return catchInternal(async () => {
       const response = await this.client.post<{ success: boolean; message: string }>(
         '/ollama/configure-remote',
-        { remoteUrl }
+        apiKey === undefined ? { remoteUrl } : { remoteUrl, apiKey }
       )
       return response.data
     })()

@@ -9,6 +9,13 @@ import KVStore from '#models/kv_store'
 import { modelNameSchema } from '#validators/download'
 import { chatSchema, getAvailableModelsSchema, unloadChatModelsSchema } from '#validators/ollama'
 import { assertNotCloudMetadataUrl } from '#validators/common'
+import {
+  describeRemoteConnectionFailure,
+  describeRemoteHttpFailure,
+  joinBackendUrl,
+  normalizeRemoteApiKey,
+  remoteAuthHeaders,
+} from '../utils/remote_ai_backend.js'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
@@ -397,9 +404,8 @@ export default class OllamaController {
       return { configured: false, connected: false }
     }
     try {
-      const testResponse = await fetch(`${remoteUrl.replace(/\/$/, '')}/v1/models`, {
-        signal: AbortSignal.timeout(3000),
-      })
+      const apiKey = await KVStore.getValue('ai.remoteOllamaApiKey')
+      const testResponse = await this._probeRemote(remoteUrl, apiKey, 3000)
       return { configured: true, connected: testResponse.ok }
     } catch {
       return { configured: true, connected: false }
@@ -419,6 +425,8 @@ export default class OllamaController {
     // the service marked installed. Otherwise fall back to uninstalled.
     if (!remoteUrl || remoteUrl.trim() === '') {
       await KVStore.clearValue('ai.remoteOllamaUrl')
+      // The key belonged to that remote host; don't keep it around for the next one.
+      await KVStore.clearValue('ai.remoteOllamaApiKey')
       const hasLocalContainer = await this._startLocalOllamaContainerIfExists()
       ollamaService.installed = hasLocalContainer
       ollamaService.installation_status = 'idle'
@@ -440,26 +448,51 @@ export default class OllamaController {
       })
     }
 
+    // Optional API key (#1434), e.g. for Open WebUI's /ollama passthrough. Three
+    // states, so the browser never needs the stored key back: `apiKey` absent keeps
+    // whatever is stored (the form shows only "set"/"not set"), an empty string or
+    // null clears it, and anything else replaces it.
+    const apiKeyProvided = Object.prototype.hasOwnProperty.call(request.all(), 'apiKey')
+    let apiKey: string | null
+    if (apiKeyProvided) {
+      try {
+        apiKey = normalizeRemoteApiKey(request.input('apiKey', null))
+      } catch (err) {
+        return response.status(400).send({
+          success: false,
+          message: err instanceof Error ? err.message : 'Invalid API key.',
+        })
+      }
+    } else {
+      apiKey = await KVStore.getValue('ai.remoteOllamaApiKey')
+    }
+
     // Test connectivity via OpenAI-compatible /v1/models endpoint (works with Ollama, LM Studio, llama.cpp, etc.)
     try {
-      const testResponse = await fetch(`${remoteUrl.replace(/\/$/, '')}/v1/models`, {
-        signal: AbortSignal.timeout(5000),
-      })
+      const testResponse = await this._probeRemote(remoteUrl, apiKey, 5000)
       if (!testResponse.ok) {
         return response.status(400).send({
           success: false,
-          message: `Could not connect to ${remoteUrl} (HTTP ${testResponse.status}). Make sure the server is running and accessible. For Ollama, start it with OLLAMA_HOST=0.0.0.0.`,
+          message: describeRemoteHttpFailure(remoteUrl, testResponse.status, !!apiKey),
         })
       }
     } catch (error) {
+      // A private-CA certificate fails here as a bare "fetch failed"; name it instead.
       return response.status(400).send({
         success: false,
-        message: `Could not connect to ${remoteUrl}. Make sure the server is running and reachable. For Ollama, start it with OLLAMA_HOST=0.0.0.0.`,
+        message: describeRemoteConnectionFailure(remoteUrl, error),
       })
     }
 
     // Save remote URL and mark service as installed
     await KVStore.setValue('ai.remoteOllamaUrl', remoteUrl.trim())
+    if (apiKeyProvided) {
+      if (apiKey) {
+        await KVStore.setValue('ai.remoteOllamaApiKey', apiKey)
+      } else {
+        await KVStore.clearValue('ai.remoteOllamaApiKey')
+      }
+    }
     ollamaService.installed = true
     ollamaService.installation_status = 'idle'
     await ollamaService.save()
@@ -483,6 +516,34 @@ export default class OllamaController {
     })
 
     return { success: true, message: 'Remote Ollama configured.' }
+  }
+
+  /**
+   * Connectivity check for a remote AI backend, sending the API key if one is set.
+   * `/v1/models` is the endpoint every supported backend shares; when it is missing
+   * (404) the native `/api/tags` is tried too, so an Ollama-only passthrough is not
+   * rejected just for lacking the OpenAI-compatible routes.
+   */
+  private async _probeRemote(
+    remoteUrl: string,
+    apiKey: string | null,
+    timeoutMs: number
+  ): Promise<{ ok: boolean; status: number }> {
+    const headers = remoteAuthHeaders(apiKey)
+    const v1 = await fetch(joinBackendUrl(remoteUrl, '/v1/models'), {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (v1.status !== 404) return { ok: v1.ok, status: v1.status }
+    const tags = await fetch(joinBackendUrl(remoteUrl, '/api/tags'), {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!tags.ok) return { ok: false, status: tags.status }
+    const body: any = await tags.json().catch(() => null)
+    return Array.isArray(body?.models)
+      ? { ok: true, status: tags.status }
+      : { ok: false, status: v1.status }
   }
 
   private async _stopLocalOllamaContainer(): Promise<void> {

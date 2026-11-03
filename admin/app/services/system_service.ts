@@ -34,6 +34,8 @@ import { invalidateAssistantNameCache } from '../../config/inertia.js'
 import { invalidateMinRelevanceCache } from '../utils/rag_relevance.js'
 import { invalidateResponseStyleCache } from '../utils/response_style.js'
 import { KiwixLibraryService } from '#services/kiwix_library_service'
+import { getAiBackendAuthHeaders } from './ai_backend_auth.js'
+import { joinBackendUrl } from '../utils/remote_ai_backend.js'
 
 @inject()
 export class SystemService {
@@ -252,11 +254,15 @@ export class SystemService {
         return null
       }
 
-      await axios.get(new URL('/api/tags', ollamaUrl).toString(), { timeout: 3000 })
+      // joinBackendUrl rather than `new URL('/api/tags', ...)`, which drops a path
+      // prefix such as Open WebUI's /ollama passthrough (#1434).
+      const headers = await getAiBackendAuthHeaders()
+      await axios.get(joinBackendUrl(ollamaUrl, '/api/tags'), { headers, timeout: 3000 })
 
       let vramMb = 0
       try {
-        const psResponse = await axios.get(new URL('/api/ps', ollamaUrl).toString(), {
+        const psResponse = await axios.get(joinBackendUrl(ollamaUrl, '/api/ps'), {
+          headers,
           timeout: 3000,
         })
         const loadedModels = Array.isArray(psResponse.data?.models) ? psResponse.data.models : []

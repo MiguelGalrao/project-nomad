@@ -29,7 +29,7 @@ export default function ModelsPage(props: {
   models: {
     availableModels: NomadOllamaModel[]
     installedModels: NomadInstalledModel[]
-    settings: { chatSuggestionsEnabled: boolean; aiAssistantCustomName: string; remoteOllamaUrl: string; ollamaFlashAttention: boolean; autoThinking: boolean; tasksModel: string; ragEnabled: boolean; contextWindow: string; minRelevance: number; relevanceCheck: boolean; responseStyle: string }
+    settings: { chatSuggestionsEnabled: boolean; aiAssistantCustomName: string; remoteOllamaUrl: string; remoteOllamaApiKeySet: boolean; ollamaFlashAttention: boolean; autoThinking: boolean; tasksModel: string; ragEnabled: boolean; contextWindow: string; minRelevance: number; relevanceCheck: boolean; responseStyle: string }
     /** Effective window per installed model, as resolved by ContextWindowService. */
     resolvedContextWindows?: Record<string, number>
   }
@@ -61,13 +61,25 @@ export default function ModelsPage(props: {
   const [remoteOllamaUrl, setRemoteOllamaUrl] = useState(props.models.settings.remoteOllamaUrl)
   const [remoteOllamaError, setRemoteOllamaError] = useState<string | null>(null)
   const [remoteOllamaSaving, setRemoteOllamaSaving] = useState(false)
+  // The stored API key never comes back to the browser (#1434): the field starts
+  // empty, and an empty field on save means "keep the saved key" unless the user
+  // asked to remove it.
+  const [remoteOllamaApiKey, setRemoteOllamaApiKey] = useState('')
+  const [removeRemoteOllamaApiKey, setRemoveRemoteOllamaApiKey] = useState(false)
 
   async function handleSaveRemoteOllama() {
     setRemoteOllamaError(null)
     setRemoteOllamaSaving(true)
     try {
-      const res = await api.configureRemoteOllama(remoteOllamaUrl || null)
+      const apiKey = removeRemoteOllamaApiKey
+        ? ''
+        : remoteOllamaApiKey.trim()
+          ? remoteOllamaApiKey
+          : undefined
+      const res = await api.configureRemoteOllama(remoteOllamaUrl || null, apiKey)
       if (res?.success) {
+        setRemoteOllamaApiKey('')
+        setRemoveRemoteOllamaApiKey(false)
         addNotification({ message: res.message, type: 'success' })
         router.reload()
       }
@@ -86,6 +98,8 @@ export default function ModelsPage(props: {
       const res = await api.configureRemoteOllama(null)
       if (res?.success) {
         setRemoteOllamaUrl('')
+        setRemoteOllamaApiKey('')
+        setRemoveRemoteOllamaApiKey(false)
         addNotification({ message: 'Remote Ollama configuration cleared.', type: 'success' })
         router.reload()
       }
@@ -480,6 +494,7 @@ export default function ModelsPage(props: {
             <p className="text-sm text-text-secondary mb-4">
               Connect to any OpenAI-compatible API server — Ollama, LM Studio, llama.cpp, and others are all supported.
               For remote Ollama instances, the host must be started with <code className="bg-surface-secondary px-1 rounded">OLLAMA_HOST=0.0.0.0</code>.
+              For Open WebUI, use its Ollama passthrough URL (e.g. <code className="bg-surface-secondary px-1 rounded">https://openwebui.example/ollama</code>) together with an API key.
             </p>
             <div className="flex items-end gap-3">
               <div className="flex-1">
@@ -493,6 +508,42 @@ export default function ModelsPage(props: {
                     setRemoteOllamaError(null)
                   }}
                 />
+                <Input
+                  name="remoteOllamaApiKey"
+                  type="password"
+                  autoComplete="off"
+                  label="API Key (optional)"
+                  helpText="Sent as a Bearer token with every request. For Open WebUI, create an API key under Settings > Account (not a session token, which expires); API keys must first be enabled in Admin Panel > Settings > Authentication."
+                  placeholder={
+                    removeRemoteOllamaApiKey
+                      ? 'The saved key will be removed on save'
+                      : props.models.settings.remoteOllamaApiKeySet
+                        ? 'A key is saved. Leave blank to keep it'
+                        : 'Not set'
+                  }
+                  value={remoteOllamaApiKey}
+                  disabled={removeRemoteOllamaApiKey}
+                  className="mt-4"
+                  onChange={(e) => {
+                    setRemoteOllamaApiKey(e.target.value)
+                    setRemoteOllamaError(null)
+                  }}
+                />
+                {props.models.settings.remoteOllamaApiKeySet && (
+                  <div className="mt-2">
+                    <StyledButton
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setRemoveRemoteOllamaApiKey((v) => !v)
+                        setRemoteOllamaApiKey('')
+                        setRemoteOllamaError(null)
+                      }}
+                    >
+                      {removeRemoteOllamaApiKey ? 'Keep Saved Key' : 'Remove Saved Key'}
+                    </StyledButton>
+                  </div>
+                )}
                 {remoteOllamaError && (
                   <p className="text-sm text-red-600 mt-1">{remoteOllamaError}</p>
                 )}

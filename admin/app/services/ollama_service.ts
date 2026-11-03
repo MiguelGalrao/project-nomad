@@ -20,6 +20,8 @@ import { BROADCAST_CHANNELS } from '../../constants/broadcast.js'
 import env from '#start/env'
 import { NOMAD_API_DEFAULT_BASE_URL } from '../../constants/misc.js'
 import KVStore from '#models/kv_store'
+import { getAiBackendAuthHeaders } from './ai_backend_auth.js'
+import { isAuthRejectionStatus } from '../utils/remote_ai_backend.js'
 import type { ModelCapabilities } from '../utils/model_capabilities.js'
 import {
   installedModelsFromOpenAIResponse,
@@ -205,6 +207,10 @@ export class OllamaService {
   private openai: OpenAI | null = null
   private ollama: Ollama | null = null
   private baseUrl: string | null = null
+  // `Authorization` for the remote backend when an API key is configured (#1434),
+  // empty otherwise. Spread into every request this service makes to the backend —
+  // the axios calls below, the OpenAI SDK, and the native ollama client alike.
+  private authHeaders: Record<string, string> = {}
   private initPromise: Promise<void> | null = null
   private isOllamaNative: boolean | null = null
   private nativeProbe: Promise<boolean> | null = null
@@ -239,13 +245,17 @@ export class OllamaService {
           this.baseUrl = ollamaUrl.trim().replace(/\/$/, '')
         }
 
+        this.authHeaders = await getAiBackendAuthHeaders()
+
         this.openai = new OpenAI({
           apiKey: 'nomad', // Required by SDK; not validated by Ollama/LM Studio/llama.cpp
           baseURL: `${this.baseUrl}/v1`,
+          // Overrides the SDK's own `Authorization: Bearer nomad` when a key is set.
+          defaultHeaders: this.authHeaders,
         })
         // Native client for `/api/chat`. Only used when the backend is really Ollama
         // (see _isNativeBackend) — it is the only transport that can set the context window.
-        this.ollama = new Ollama({ host: this.baseUrl })
+        this.ollama = new Ollama({ host: this.baseUrl, headers: this.authHeaders })
       })()
     }
     return this.initPromise
@@ -270,16 +280,24 @@ export class OllamaService {
     if (!this.nativeProbe) {
       this.nativeProbe = (async () => {
         try {
-          const response = await axios.get(`${this.baseUrl}/api/tags`, { timeout: 5000 })
+          const response = await axios.get(`${this.baseUrl}/api/tags`, {
+            headers: this.authHeaders,
+            timeout: 5000,
+          })
           // LM Studio answers 200 on unknown paths with an incompatible body — validate the shape.
           this.isOllamaNative = Array.isArray(response.data?.models)
         } catch (err) {
-          if (axios.isAxiosError(err) && err.response === undefined) {
+          if (
+            axios.isAxiosError(err) &&
+            (err.response === undefined || isAuthRejectionStatus(err.response.status))
+          ) {
             // No HTTP response at all: the backend is unreachable (down, starting, or busy
             // past the timeout), which proves nothing about its identity. A busy Ollama
             // times out exactly like a non-Ollama server here, and memoizing `false` for
             // the process lifetime blocks model pulls with a misleading error (#1349).
             // Degrade for this call only and let the next caller re-probe.
+            // A 401/403 is the same: Open WebUI's /ollama passthrough refuses a missing
+            // or wrong API key before it ever reaches Ollama (#1434).
             this.nativeProbe = null
             logger.info(
               '[OllamaService] Native-API probe could not reach the backend; leaving the backend type undetermined and re-probing on next use.'
@@ -383,7 +401,7 @@ export class OllamaService {
       const pullResponse = await axios.post(
         `${this.baseUrl}/api/pull`,
         { model, stream: true },
-        { responseType: 'stream', timeout: 0, signal }
+        { responseType: 'stream', headers: this.authHeaders, timeout: 0, signal }
       )
 
       // Ollama's pull API reports progress per-digest (each blob). A single model can contain
@@ -899,7 +917,7 @@ export class OllamaService {
       const response = await axios.post(
         `${this.baseUrl}/api/show`,
         { model: modelName },
-        { timeout: 5000 }
+        { headers: this.authHeaders, timeout: 5000 }
       )
       const data = response.data ?? {}
       const info: NomadModelInfo = {
@@ -939,13 +957,16 @@ export class OllamaService {
         const response = await axios.post(
           `${this.baseUrl}/api/show`,
           { model: modelName },
-          { timeout: 3000 }
+          { headers: this.authHeaders, timeout: 3000 }
         )
         return response.data
       },
       // A direct llama.cpp server reports the loaded model's input modalities at /props.
       llamaProps: async () => {
-        const response = await axios.get(`${this.baseUrl}/props`, { timeout: 3000 })
+        const response = await axios.get(`${this.baseUrl}/props`, {
+          headers: this.authHeaders,
+          timeout: 3000,
+        })
         return response.data
       },
     })
@@ -978,6 +999,7 @@ export class OllamaService {
     try {
       await axios.delete(`${this.baseUrl}/api/delete`, {
         data: { model: modelName },
+        headers: this.authHeaders,
         timeout: 10000,
       })
       return { success: true, message: `Model "${modelName}" deleted.` }
@@ -1105,7 +1127,7 @@ export class OllamaService {
             truncate: true,
             options: { num_ctx: 8192 },
           },
-          { timeout: 60000 }
+          { headers: this.authHeaders, timeout: 60000 }
         )
         // Some backends (e.g. LM Studio) return HTTP 200 for unknown endpoints with an incompatible
         // body — validate explicitly before accepting the result. Kept even though the probe now
@@ -1162,7 +1184,10 @@ export class OllamaService {
     if (!this.baseUrl) return false
 
     try {
-      const response = await axios.get(`${this.baseUrl}/api/ps`, { timeout: 5000 })
+      const response = await axios.get(`${this.baseUrl}/api/ps`, {
+        headers: this.authHeaders,
+        timeout: 5000,
+      })
       const models: Array<{ name?: string; size_vram?: number }> = response.data?.models ?? []
       // Match any loaded model whose name signals it's an embedding model.
       // nomic-embed-text, mxbai-embed-large, snowflake-arctic-embed, etc. all follow this convention.
@@ -1207,7 +1232,10 @@ export class OllamaService {
 
     let loadedModels: string[] = []
     try {
-      const response = await axios.get(`${this.baseUrl}/api/ps`, { timeout: 5000 })
+      const response = await axios.get(`${this.baseUrl}/api/ps`, {
+        headers: this.authHeaders,
+        timeout: 5000,
+      })
       loadedModels = (response.data?.models ?? [])
         .map((m: { name?: string }) => m.name)
         .filter((name: unknown): name is string => typeof name === 'string')
@@ -1240,7 +1268,7 @@ export class OllamaService {
           await axios.post(
             `${this.baseUrl}/api/generate`,
             { model: modelName, prompt: '', keep_alive: 0 },
-            { timeout: 10000 }
+            { headers: this.authHeaders, timeout: 10000 }
           )
         } catch (err: any) {
           logger.warn(
@@ -1266,7 +1294,10 @@ export class OllamaService {
 
     try {
       // Prefer the Ollama native endpoint which includes size and metadata
-      const response = await axios.get(`${this.baseUrl}/api/tags`, { timeout: 5000 })
+      const response = await axios.get(`${this.baseUrl}/api/tags`, {
+        headers: this.authHeaders,
+        timeout: 5000,
+      })
       // LM Studio returns HTTP 200 for unknown endpoints with an incompatible body — validate explicitly
       if (!Array.isArray(response.data?.models)) {
         throw new Error('Not an Ollama-compatible /api/tags response')
@@ -1283,7 +1314,11 @@ export class OllamaService {
       // timeout while Ollama is busy or still starting, a refused connection — proves
       // nothing, and marking it non-Ollama here made every model download fail with
       // "pulling is only supported for Ollama backends" on stock installs (#1349).
-      const backendAnswered = axios.isAxiosError(tagsErr) ? tagsErr.response !== undefined : true
+      // A 401/403 likewise proves nothing: an authenticating proxy such as Open WebUI's
+      // /ollama passthrough rejects a bad key before Ollama sees the request (#1434).
+      const backendAnswered = axios.isAxiosError(tagsErr)
+        ? tagsErr.response !== undefined && !isAuthRejectionStatus(tagsErr.response.status)
+        : true
       if (backendAnswered) {
         this.isOllamaNative = false
         this.nativeProbe = Promise.resolve(false)

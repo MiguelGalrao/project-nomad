@@ -51,6 +51,13 @@ export const KV_STORE_SCHEMA = {
   'ai.assistantCustomName':     'string',
   'gpu.type':                   'string',
   'ai.remoteOllamaUrl':         'string',
+  // Optional bearer token for the remote AI backend, sent as
+  // `Authorization: Bearer <key>` on every request to it (#1434) — e.g. an Open
+  // WebUI API key when ai.remoteOllamaUrl points at Open WebUI's /ollama
+  // passthrough. Deliberately NOT in SETTINGS_KEYS: the generic settings API
+  // would hand it back to the browser. Written only by
+  // POST /api/ollama/configure-remote; the UI only ever sees whether it is set.
+  'ai.remoteOllamaApiKey':      'string',
   'ai.ollamaFlashAttention':    'boolean',
   'ai.autoThinking':            'boolean',
   // Model used for ancillary AI work (chat titles, chat suggestions) instead of

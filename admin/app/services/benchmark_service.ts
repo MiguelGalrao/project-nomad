@@ -39,6 +39,7 @@ import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { BROADCAST_CHANNELS } from '../../constants/broadcast.js'
 import { BenchmarkTelemetrySampler } from './benchmark_telemetry.js'
 import Dockerode from 'dockerode'
+import { getAiBackendAuthHeaders } from './ai_backend_auth.js'
 
 // HMAC secret for signing submissions to the benchmark repository
 // This provides basic protection against casual API abuse.
@@ -961,17 +962,21 @@ export class BenchmarkService {
       if (!ollamaAPIURL) {
         throw new Error('AI Assistant service location could not be determined. Ensure AI Assistant is installed and running.')
       }
+      // getServiceURL may resolve to a remote backend that wants an API key (#1434).
+      const aiHeaders = await getAiBackendAuthHeaders()
 
       // Check if Ollama is available
       try {
-        await axios.get(`${ollamaAPIURL}/api/tags`, { timeout: 5000 })
+        await axios.get(`${ollamaAPIURL}/api/tags`, { headers: aiHeaders, timeout: 5000 })
       } catch (error: any) {
         const errorCode = error.code || error.response?.status || 'unknown'
         throw new Error(`Ollama is not running or not accessible (${errorCode}). Ensure AI Assistant is installed and running.`)
       }
 
       // Record the Ollama version for forensics (null-tolerant — never fail the run on this)
-      const versionResp = await axios.get(`${ollamaAPIURL}/api/version`, { timeout: 5000 }).catch(() => null)
+      const versionResp = await axios
+        .get(`${ollamaAPIURL}/api/version`, { headers: aiHeaders, timeout: 5000 })
+        .catch(() => null)
       const ollamaVersion: string | null = versionResp?.data?.version ?? null
 
       // GPU-util overlay (NVIDIA only): probe once; if a GPU answers, poll for the
@@ -1078,6 +1083,7 @@ export class BenchmarkService {
   private async _runSingleAIInference(
     ollamaAPIURL: string
   ): Promise<{ tps: number; ttft: number }> {
+    const headers = await getAiBackendAuthHeaders()
     const startTime = Date.now()
 
     const response = await axios.post(
@@ -1088,7 +1094,7 @@ export class BenchmarkService {
         stream: false,
         options: { num_predict: AI_BENCHMARK_NUM_PREDICT },
       },
-      { timeout: 120000 }
+      { headers, timeout: 120000 }
     )
 
     const endTime = Date.now()
@@ -1133,7 +1139,10 @@ export class BenchmarkService {
 
     // If the model is already present, no download → no disk need.
     try {
-      const tags = await axios.get(`${ollamaAPIURL}/api/tags`, { timeout: 5000 })
+      const tags = await axios.get(`${ollamaAPIURL}/api/tags`, {
+        headers: await getAiBackendAuthHeaders(),
+        timeout: 5000,
+      })
       const models: string[] = (tags.data?.models ?? []).map((m: { name?: string }) => m.name)
       if (models.includes(AI_BENCHMARK_MODEL)) return
     } catch {
@@ -1169,7 +1178,8 @@ export class BenchmarkService {
    */
   private async _unloadResidentModels(ollamaAPIURL: string): Promise<void> {
     try {
-      const ps = await axios.get(`${ollamaAPIURL}/api/ps`, { timeout: 5000 })
+      const headers = await getAiBackendAuthHeaders()
+      const ps = await axios.get(`${ollamaAPIURL}/api/ps`, { headers, timeout: 5000 })
       const loaded: string[] = (ps.data?.models ?? [])
         .map((m: { name?: string; model?: string }) => m.name || m.model)
         .filter((n: string | undefined): n is string => !!n)
@@ -1180,7 +1190,11 @@ export class BenchmarkService {
       for (const model of loaded) {
         // keep_alive:0 tells Ollama to unload immediately (no prompt needed).
         await axios
-          .post(`${ollamaAPIURL}/api/generate`, { model, keep_alive: 0 }, { timeout: 15000 })
+          .post(
+            `${ollamaAPIURL}/api/generate`,
+            { model, keep_alive: 0 },
+            { headers, timeout: 15000 }
+          )
           .catch((e) => logger.warn(`[BenchmarkService] Failed to unload ${model}: ${e.message}`))
       }
     } catch (error: any) {
