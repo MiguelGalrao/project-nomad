@@ -4,7 +4,10 @@ import {
   ELISION_MARKER,
   HISTORY_EVICTION_BLOCK,
   MAX_RESPONSE_RESERVE,
+  SECTION_GROUP_KEY,
+  groupIntoSections,
   groupIntoTurns,
+  limitToSections,
   planPrompt,
   type BudgetChunk,
   type BudgetInputs,
@@ -279,4 +282,123 @@ test('empty history and no chunks still produces a valid prompt', () => {
   assert.equal(result.trace.chunksKept, 0)
   assert.equal(result.trace.turnsKept, 0)
   assert.equal(result.trace.historyElided, false)
+})
+
+// --- Atomic sections (#1523) -------------------------------------------------
+
+const section = (group: string, text: string): BudgetChunk => ({
+  text,
+  metadata: { [SECTION_GROUP_KEY]: group },
+})
+
+test('ungrouped chunks are each their own unit, in order', () => {
+  const chunks: BudgetChunk[] = [{ text: 'a' }, { text: 'b', metadata: { section_title: 'x' } }]
+  const units = groupIntoSections(chunks)
+  assert.deepEqual(
+    units.map((u) => [u.group, u.chunks.map((c) => c.text)]),
+    [
+      [null, ['a']],
+      [null, ['b']],
+    ]
+  )
+})
+
+test('a section is gathered at the rank of its best chunk, members in order', () => {
+  const units = groupIntoSections([
+    section('Scene 6', 'six-a'),
+    { text: 'other' },
+    section('Scene 6', 'six-b'),
+  ])
+  assert.deepEqual(
+    units.map((u) => u.chunks.map((c) => c.text)),
+    [['six-a', 'six-b'], ['other']]
+  )
+})
+
+test('a section that fits is kept whole', () => {
+  const chunks = [section('Scene 6', words(100, 'sixA')), section('Scene 6', words(100, 'sixB'))]
+  const result = planPrompt(makeInputs({ ragChunks: chunks, contextWindow: 8192 }))
+  assert.equal(result.trace.chunksKept, 2)
+  assert.equal(result.trace.chunksDropped, 0)
+  assert.deepEqual(result.trace.sectionsDropped, [])
+  assert.deepEqual(result.keptChunks, chunks)
+})
+
+test('a section that does not fit is dropped whole, and a smaller later chunk still fits', () => {
+  // 4096 window -> ~1000-token RAG share. The two halves of the scene would each
+  // fit on their own after the first chunk, but not together — exactly the case
+  // that used to keep the first half and drop the continuation.
+  const chunks: BudgetChunk[] = [
+    { text: words(300, 'best') },
+    section('Scene 6', words(450, 'sixA')),
+    section('Scene 6', words(450, 'sixB')),
+    { text: words(100, 'small') },
+  ]
+  const result = planPrompt(makeInputs({ ragChunks: chunks, contextWindow: 4096 }))
+  const kept = result.keptChunks.map((c) => c.text.split(' ')[0])
+  assert.deepEqual(kept, ['best0', 'small0'])
+  assert.equal(result.trace.chunksKept, 2)
+  assert.equal(result.trace.chunksDropped, 2)
+  assert.equal(result.trace.sectionsDropped.length, 1)
+  assert.equal(result.trace.sectionsDropped[0].group, 'Scene 6')
+  assert.equal(result.trace.sectionsDropped[0].chunks, 2)
+  assert.ok(result.trace.sectionsDropped[0].tokens > 900)
+
+  const ragMessage = result.messages.find((m) => m.content.includes('[Context 1]'))!
+  assert.ok(!ragMessage.content.includes('sixA0'), 'no part of the dropped section may leak in')
+  assert.ok(!ragMessage.content.includes('sixB0'), 'no part of the dropped section may leak in')
+})
+
+test('ungrouped chunks of the same sizes still budget one at a time', () => {
+  // Same shape as above without section markers: the planner keeps the first
+  // half on its own, as it always has. Grouping is opt-in.
+  const chunks: BudgetChunk[] = [
+    { text: words(300, 'best') },
+    { text: words(450, 'sixA') },
+    { text: words(450, 'sixB') },
+    { text: words(100, 'small') },
+  ]
+  const result = planPrompt(makeInputs({ ragChunks: chunks, contextWindow: 4096 }))
+  assert.deepEqual(
+    result.keptChunks.map((c) => c.text.split(' ')[0]),
+    ['best0', 'sixA0', 'small0']
+  )
+  assert.deepEqual(result.trace.sectionsDropped, [])
+})
+
+test('kept chunks and sections preserve rank order, sections contiguous', () => {
+  const chunks: BudgetChunk[] = [
+    section('Scene 2', 'two-a'),
+    { text: 'loose' },
+    section('Scene 2', 'two-b'),
+    section('Scene 4', 'four-a'),
+  ]
+  const result = planPrompt(makeInputs({ ragChunks: chunks }))
+  assert.deepEqual(
+    result.keptChunks.map((c) => c.text),
+    ['two-a', 'two-b', 'loose', 'four-a']
+  )
+  const ragMessage = result.messages.find((m) => m.content.includes('[Context 1]'))!
+  const order = ['two-a', 'two-b', 'loose', 'four-a'].map((t) => ragMessage.content.indexOf(t))
+  assert.deepEqual(
+    [...order].sort((a, b) => a - b),
+    order
+  )
+})
+
+test('the result-count cap counts a section as one result', () => {
+  const chunks: BudgetChunk[] = [
+    section('Scene 6', 'six-a'),
+    section('Scene 6', 'six-b'),
+    { text: 'next' },
+    { text: 'last' },
+  ]
+  assert.deepEqual(
+    limitToSections(chunks, 2).map((c) => c.text),
+    ['six-a', 'six-b', 'next']
+  )
+  // Without markers it is a plain slice.
+  const plain = chunks.map((c) => ({ text: c.text }))
+  assert.deepEqual(limitToSections(plain, 2), plain.slice(0, 2))
+  assert.deepEqual(limitToSections(plain, 0), [])
 })

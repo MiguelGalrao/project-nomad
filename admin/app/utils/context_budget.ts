@@ -19,7 +19,8 @@
  *                          generation cap is whatever the window has left once
  *                          the prompt is assembled, which is usually far more.
  *   2. Fixed blocks      — system prompts and the current question. Never dropped.
- *   3. Retrieved context — whole chunks, best-first, until its share is spent.
+ *   3. Retrieved context — whole chunks (or whole sections, see SECTION_GROUP_KEY),
+ *                          best-first, until its share is spent.
  *   4. History           — whole turns, newest-first, into whatever remains.
  *
  * Pure and dependency-free so it runs under bare `node --test`, the same
@@ -33,6 +34,28 @@ export type BudgetMessage = { role: BudgetRole; content: string }
 
 /** A retrieved chunk, already ranked — index 0 is the best match. */
 export type BudgetChunk = { text: string; metadata?: Record<string, any> }
+
+/**
+ * Metadata key that marks chunks as parts of one logical section (#1523).
+ *
+ * When retrieval expands a hit into several chunks of the same section — a
+ * screenplay scene, a manual procedure — those chunks only make sense together.
+ * Budgeting them one at a time let the planner keep the first half of a scene
+ * and drop its continuation, so the model answered from a fragment with no way
+ * to know the rest existed. Chunks that share a non-empty value under this key
+ * are therefore kept or dropped as one unit.
+ *
+ * Opt-in on purpose: two independent hits that happen to share a heading are
+ * still separate answers and are budgeted separately, exactly as before. Only
+ * the code that deliberately expands a hit into a section sets this.
+ */
+export const SECTION_GROUP_KEY = 'section_group'
+
+/** A run of chunks budgeted as one unit; `group` is null for an ordinary chunk. */
+export type ChunkUnit = { group: string | null; chunks: BudgetChunk[] }
+
+/** A section that was left out whole because it did not fit (#1523). */
+export type DroppedSection = { group: string; chunks: number; tokens: number }
 
 /**
  * Where the per-turn retrieved-context block goes.
@@ -89,11 +112,19 @@ export type BudgetTrace = {
   queryTruncated: boolean
   ragPlacement: RagPlacement
   numPredict: number
+  /** Grouped sections omitted whole because they did not fit (#1523). */
+  sectionsDropped: DroppedSection[]
 }
 
 export type BudgetResult = {
   messages: BudgetMessage[]
   trace: BudgetTrace
+  /**
+   * The chunks that made it into the context block, in the order rendered.
+   * Not necessarily a prefix of the input: a chunk or section that did not fit
+   * is skipped while later, smaller ones may still be kept.
+   */
+  keptChunks: BudgetChunk[]
   /**
    * What to send as num_predict: the space the window actually has left after
    * the prompt, less a margin for estimator error. Never below the reserve.
@@ -164,6 +195,52 @@ export function groupIntoTurns(history: BudgetMessage[]): BudgetMessage[][] {
 }
 
 /**
+ * Group ranked chunks into budgeting units.
+ *
+ * An ungrouped chunk is a unit of its own, so a list with no section markers
+ * comes back as one unit per chunk in the original order — the planner then
+ * behaves exactly as it did before grouping existed. Chunks sharing a section
+ * group are gathered into the unit created by the group's first (best-ranked)
+ * member, keeping their relative order, so a section is rendered contiguously
+ * at the rank of its best match.
+ */
+export function groupIntoSections(chunks: BudgetChunk[]): ChunkUnit[] {
+  const units: ChunkUnit[] = []
+  const byGroup = new Map<string, ChunkUnit>()
+  for (const chunk of chunks) {
+    const raw = chunk.metadata?.[SECTION_GROUP_KEY]
+    const group = typeof raw === 'string' && raw.length > 0 ? raw : null
+    if (group === null) {
+      units.push({ group: null, chunks: [chunk] })
+      continue
+    }
+    const existing = byGroup.get(group)
+    if (existing) {
+      existing.chunks.push(chunk)
+    } else {
+      const unit: ChunkUnit = { group, chunks: [chunk] }
+      byGroup.set(group, unit)
+      units.push(unit)
+    }
+  }
+  return units
+}
+
+/**
+ * Cap a ranked chunk list at `maxUnits` budgeting units.
+ *
+ * The model-size tier caps how many results a small model is asked to read.
+ * Applied as a plain slice it could cut a section in half before the planner
+ * ever saw it (#1523), so the cap counts a section as one result. Without
+ * section markers this is identical to `chunks.slice(0, maxUnits)`.
+ */
+export function limitToSections(chunks: BudgetChunk[], maxUnits: number): BudgetChunk[] {
+  return groupIntoSections(chunks)
+    .slice(0, Math.max(0, maxUnits))
+    .flatMap((unit) => unit.chunks)
+}
+
+/**
  * Plan the prompt.
  *
  * Never returns a message array estimated to exceed `contextWindow -
@@ -216,21 +293,33 @@ export function planPrompt(inputs: BudgetInputs): BudgetResult {
   // character count, which could hand the model a chunk cut off mid-sentence —
   // the worst of both worlds, since it costs tokens without carrying a complete
   // fact. A chunk that doesn't fit is dropped, not shortened.
+  //
+  // The same rule one level up for sections (#1523): chunks expanded from one
+  // section are kept or dropped together, never split, and a section left out
+  // is recorded so the caller can say so rather than the model silently
+  // reading half a scene.
   const ragBudget = Math.max(0, Math.floor(Math.max(0, remaining) * (inputs.ragShare ?? DEFAULT_RAG_SHARE)))
   const keptChunks: BudgetChunk[] = []
+  const sectionsDropped: DroppedSection[] = []
   let ragTokens = 0
 
-  if (inputs.ragChunks.length > 0 && ragBudget > 0) {
-    for (const chunk of inputs.ragChunks) {
-      const candidate = [...keptChunks, chunk]
-      const rendered = inputs.renderRagBlock(candidate)
-      const candidateTokens = cost([{ role: 'system', content: rendered }])
-      if (candidateTokens <= ragBudget) {
-        keptChunks.push(chunk)
-        ragTokens = candidateTokens
-      }
-      // Keep scanning: a later, smaller chunk may still fit where this one didn't.
+  for (const unit of groupIntoSections(inputs.ragChunks)) {
+    const candidate = [...keptChunks, ...unit.chunks]
+    const candidateTokens =
+      ragBudget > 0
+        ? cost([{ role: 'system', content: inputs.renderRagBlock(candidate) }])
+        : Number.POSITIVE_INFINITY
+    if (candidateTokens <= ragBudget) {
+      keptChunks.push(...unit.chunks)
+      ragTokens = candidateTokens
+    } else if (unit.group !== null) {
+      sectionsDropped.push({
+        group: unit.group,
+        chunks: unit.chunks.length,
+        tokens: cost([{ role: 'system', content: inputs.renderRagBlock(unit.chunks) }]),
+      })
     }
+    // Keep scanning: a later, smaller chunk may still fit where this one didn't.
   }
 
   const ragMessage: BudgetMessage | null =
@@ -299,6 +388,7 @@ export function planPrompt(inputs: BudgetInputs): BudgetResult {
   return {
     messages,
     numPredict,
+    keptChunks,
     trace: {
       contextWindow,
       responseReserve,
@@ -316,6 +406,7 @@ export function planPrompt(inputs: BudgetInputs): BudgetResult {
       queryTruncated,
       ragPlacement: placement,
       numPredict,
+      sectionsDropped,
     },
   }
 }

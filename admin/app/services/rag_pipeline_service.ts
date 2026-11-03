@@ -16,7 +16,7 @@ import {
 } from '../../constants/ollama.js'
 import type { OllamaChatMessage } from '../../types/ollama.js'
 import type { PipelineOptions, PipelineTrace, RetrievalFloorStats, RetrievedChunk } from '../../types/rag.js'
-import { planPrompt } from '../utils/context_budget.js'
+import { limitToSections, planPrompt } from '../utils/context_budget.js'
 import { estimateMessagesTokens } from '../utils/token_estimate.js'
 import { resolveMinFinalScore } from '../utils/rag_relevance.js'
 import { resolveTasksModel } from '../utils/tasks_model.js'
@@ -192,7 +192,10 @@ export class RagPipelineService {
     const modelInfo = await this.ollamaService.getModelInfo(model).catch(() => undefined)
     const limits = getContextLimitsForModel(model, RAG_CONTEXT_LIMITS, modelInfo?.parameterSize)
     trace.contextLimits = limits
-    const candidateDocs = relevantDocs.slice(0, limits.maxResults)
+    // Counted in sections rather than chunks, so the tier cap can't cut an
+    // expanded section in half before the planner sees it (#1523). Identical to a
+    // plain slice when no chunk carries a section group.
+    const candidateDocs = limitToSections(relevantDocs, limits.maxResults) as RetrievedChunk[]
 
     const contextWindow = await this.contextWindowService.windowFor(model)
     const ratio = await this.tokenCalibration.ratioFor(model)
@@ -210,13 +213,25 @@ export class RagPipelineService {
     })
 
     trace.messages = plan.messages as OllamaChatMessage[]
-    trace.injected = candidateDocs.slice(0, plan.trace.chunksKept)
+    // What the planner actually kept, not a prefix of the candidates: a chunk or
+    // section that didn't fit is skipped while a later, smaller one may survive,
+    // and a prefix slice would then cite the wrong passages.
+    trace.injected = plan.keptChunks as RetrievedChunk[]
     trace.budget = plan.trace
     trace.numCtx = contextWindow
     trace.numPredict = plan.numPredict
     // Recorded uncalibrated so TokenCalibrationService can compare like with like;
     // applying the ratio here and again there would make the EWMA chase itself.
     trace.uncalibratedPromptTokens = estimateMessagesTokens(plan.messages, 1)
+
+    // A section is never injected partially; when one is left out, say which, so
+    // "the model didn't see the rest of the scene" is visible in the logs (#1523).
+    for (const section of plan.trace.sectionsDropped) {
+      logger.info(
+        `[RagPipeline] Budget for ${model}: dropped section "${section.group}" ` +
+          `(${section.chunks} chunk(s), ~${section.tokens} tokens) — did not fit`
+      )
+    }
 
     if (plan.trace.turnsDropped > 0 || plan.trace.chunksDropped > 0 || plan.trace.queryTruncated) {
       logger.info(
