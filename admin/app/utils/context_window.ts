@@ -121,20 +121,8 @@ export function snapToLadder(tokens: number): number {
  */
 const KV_BYTES_PER_ELEMENT = 2
 
-/**
- * Exact KV-cache cost per token, from the model's own GGUF metadata.
- *
- *     2 (K and V) x layers x kv_heads x head_dim x bytes_per_element
- *
- * For llama3:8b that is 2 x 32 x 8 x 128 x 2 = 128 KiB per token, so an 8k
- * window costs 1 GiB — which is why "just set num_ctx high" is not free advice
- * on the hardware NOMAD targets.
- *
- * Returns undefined when the metadata is missing (non-Ollama backend, or an
- * architecture that names its keys differently), leaving the caller to fall back
- * to `estimateKvBytesPerToken`.
- */
-export function computeKvBytesPerToken(modelInfo: unknown): number | undefined {
+/** Turn an /api/show `model_info` blob (plain object or Map) into a Map. */
+function modelInfoMap(modelInfo: unknown): Map<string, any> | undefined {
   if (!modelInfo) return undefined
   const entries: [string, any][] =
     modelInfo instanceof Map
@@ -143,7 +131,55 @@ export function computeKvBytesPerToken(modelInfo: unknown): number | undefined {
         ? Object.entries(modelInfo as Record<string, any>)
         : []
   if (entries.length === 0) return undefined
-  const info = new Map(entries)
+  return new Map(entries)
+}
+
+/**
+ * The KV-cache cost of a model, split into what grows with the window and what
+ * does not.
+ *
+ * `perTokenBytes` is charged for every token of `num_ctx`. `fixedBytes` is the
+ * cache held by sliding-window attention layers, which never grows past the
+ * window they attend over no matter how large `num_ctx` gets (#1446).
+ */
+export type KvCacheCost = {
+  perTokenBytes: number
+  fixedBytes: number
+}
+
+/**
+ * Exact KV-cache cost, from the model's own GGUF metadata.
+ *
+ *     2 (K and V) x layers x kv_heads x head_dim x bytes_per_element
+ *
+ * For llama3:8b that is 2 x 32 x 8 x 128 x 2 = 128 KiB per token, so an 8k
+ * window costs 1 GiB — which is why "just set num_ctx high" is not free advice
+ * on the hardware NOMAD targets.
+ *
+ * Two refinements for interleaved-attention models such as Gemma 4 (#1446):
+ *
+ *   - `attention.head_count_kv` may be a per-layer array rather than one number.
+ *     Each layer is charged its own head count; treating the array as missing and
+ *     falling back to `head_count` overstated gemma4:12b nearly 100-fold.
+ *   - When `attention.sliding_window_pattern` marks layers as sliding-window, only
+ *     the remaining global layers are charged per token. A sliding layer caches at
+ *     most `attention.sliding_window` tokens, sized by `key_length_swa` /
+ *     `value_length_swa`, so it is a fixed cost. It is budgeted at the full
+ *     sliding window: every window we hand out is at least MIN_CONTEXT, which is
+ *     at or above the sliding window of the models that use one.
+ *
+ * Ollama returns both arrays as `null` from a non-verbose /api/show; the service
+ * re-fetches verbosely when that happens (see `needsVerboseModelInfo`). Should
+ * they still be missing, this degrades to the old every-layer-is-global estimate,
+ * which overstates cost and so errs toward a smaller window, never an OOM.
+ *
+ * Returns undefined when the metadata is missing (non-Ollama backend, or an
+ * architecture that names its keys differently), leaving the caller to fall back
+ * to `estimateKvBytesPerToken`.
+ */
+export function computeKvCacheCost(modelInfo: unknown): KvCacheCost | undefined {
+  const info = modelInfoMap(modelInfo)
+  if (!info) return undefined
 
   const arch = info.get('general.architecture')
   if (typeof arch !== 'string') return undefined
@@ -153,10 +189,21 @@ export function computeKvBytesPerToken(modelInfo: unknown): number | undefined {
   }
 
   const layers = num('block_count')
+  if (!layers) return undefined
+
   // Grouped-query attention means KV heads are usually far fewer than attention
-  // heads; using head_count here would overestimate cost several-fold.
+  // heads; using head_count here would overestimate cost several-fold. A
+  // per-layer array is only trusted when it covers every layer with a sane count.
+  const kvHeadsArray = info.get(`${arch}.attention.head_count_kv`)
+  const perLayerKvHeads =
+    Array.isArray(kvHeadsArray) &&
+    kvHeadsArray.length === layers &&
+    kvHeadsArray.every((h) => typeof h === 'number' && h >= 0)
+      ? (kvHeadsArray as number[])
+      : undefined
   const kvHeads = num('attention.head_count_kv') ?? num('attention.head_count')
-  if (!layers || !kvHeads) return undefined
+  if (!perLayerKvHeads && !kvHeads) return undefined
+  const kvHeadsAt = (layer: number): number => perLayerKvHeads?.[layer] ?? kvHeads!
 
   // Prefer explicit key/value lengths; otherwise derive head_dim from the
   // embedding width and the attention head count.
@@ -168,7 +215,59 @@ export function computeKvBytesPerToken(modelInfo: unknown): number | undefined {
   }
   if (!headDim) return undefined
 
-  return 2 * layers * kvHeads * headDim * KV_BYTES_PER_ELEMENT
+  // Sliding-window layers, if the model declares a per-layer pattern and the
+  // window it slides over. Without both, every layer is treated as global.
+  const pattern = info.get(`${arch}.attention.sliding_window_pattern`)
+  const slidingWindow = num('attention.sliding_window')
+  const hasSlidingPattern =
+    Array.isArray(pattern) &&
+    pattern.length === layers &&
+    pattern.every((p) => typeof p === 'boolean') &&
+    slidingWindow !== undefined
+  const swaKeyLength = num('attention.key_length_swa') ?? headDim
+  const swaValueLength = num('attention.value_length_swa') ?? swaKeyLength
+
+  let globalHeads = 0
+  let slidingHeads = 0
+  for (let layer = 0; layer < layers; layer++) {
+    if (hasSlidingPattern && pattern[layer] === true) slidingHeads += kvHeadsAt(layer)
+    else globalHeads += kvHeadsAt(layer)
+  }
+
+  return {
+    perTokenBytes: 2 * globalHeads * headDim * KV_BYTES_PER_ELEMENT,
+    fixedBytes: hasSlidingPattern
+      ? slidingHeads * (swaKeyLength + swaValueLength) * KV_BYTES_PER_ELEMENT * slidingWindow
+      : 0,
+  }
+}
+
+/**
+ * Per-token KV-cache cost — the part of `computeKvCacheCost` that grows with the
+ * window. Undefined under the same conditions.
+ */
+export function computeKvBytesPerToken(modelInfo: unknown): number | undefined {
+  return computeKvCacheCost(modelInfo)?.perTokenBytes
+}
+
+/**
+ * Whether a non-verbose /api/show withheld metadata the KV calculation needs.
+ *
+ * Ollama elides long arrays from `model_info` unless asked with `verbose: true`,
+ * leaving the key present with a `null` value. `head_count_kv` and
+ * `sliding_window_pattern` are per-layer arrays on interleaved-attention models
+ * like Gemma 4, so they arrive as `null` and the KV cost is overstated enough to
+ * pin the window to the floor (#1446). The verbose response also carries the
+ * whole tokenizer vocabulary, so it is only worth fetching when this says so.
+ */
+export function needsVerboseModelInfo(modelInfo: unknown): boolean {
+  const info = modelInfoMap(modelInfo)
+  if (!info) return false
+  const arch = info.get('general.architecture')
+  if (typeof arch !== 'string') return false
+  return ['attention.head_count_kv', 'attention.sliding_window_pattern'].some(
+    (suffix) => info.has(`${arch}.${suffix}`) && info.get(`${arch}.${suffix}`) === null
+  )
 }
 
 /**
@@ -200,6 +299,11 @@ export type ContextWindowInputs = {
   modelfileNumCtx?: number
   /** Cost of one token of KV cache, exact or estimated. */
   kvBytesPerToken: number
+  /**
+   * KV cache that does not grow with the window (sliding-window attention
+   * layers, #1446). Comes out of the pool before the per-token division.
+   */
+  kvFixedBytes?: number
   /** Memory available for the model, in bytes (VRAM, or a share of system RAM). */
   availableBytes?: number
   /** On-disk size of the weights, in bytes — they occupy the same pool. */
@@ -238,7 +342,10 @@ export function resolveContextWindow(inputs: ContextWindowInputs): ContextWindow
 
   let affordableTokens: number | undefined
   if (inputs.availableBytes && inputs.availableBytes > 0 && inputs.kvBytesPerToken > 0) {
-    const forKv = inputs.availableBytes * MEMORY_SAFETY_FRACTION - (inputs.modelBytes ?? 0)
+    const forKv =
+      inputs.availableBytes * MEMORY_SAFETY_FRACTION -
+      (inputs.modelBytes ?? 0) -
+      (inputs.kvFixedBytes ?? 0)
     affordableTokens = Math.max(0, Math.floor(forKv / inputs.kvBytesPerToken))
     ceilings.push({ value: affordableTokens, source: 'memory' })
   }

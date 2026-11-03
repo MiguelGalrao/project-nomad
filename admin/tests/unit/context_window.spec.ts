@@ -4,7 +4,9 @@ import {
   MIN_CONTEXT,
   UNKNOWN_BACKEND_CONTEXT,
   computeKvBytesPerToken,
+  computeKvCacheCost,
   estimateKvBytesPerToken,
+  needsVerboseModelInfo,
   parseParameterBillions,
   parseUserContextCap,
   readContextLength,
@@ -65,6 +67,106 @@ test('KV computation returns undefined on incomplete metadata', () => {
   assert.equal(computeKvBytesPerToken({ 'general.architecture': 'llama' }), undefined)
   assert.equal(computeKvBytesPerToken({}), undefined)
   assert.equal(computeKvBytesPerToken(undefined), undefined)
+})
+
+const MIB = 2 ** 20
+
+/**
+ * Verbose /api/show model_info for gemma4:12b-it-qat (#1446), trimmed to the
+ * keys we read. Eight repeats of five sliding-window layers (8 KV heads, 256-dim)
+ * followed by one global layer (1 KV head, 512-dim).
+ */
+const GEMMA4_12B_INFO = {
+  'general.architecture': 'gemma4',
+  'gemma4.block_count': 48,
+  'gemma4.attention.head_count': 16,
+  'gemma4.attention.head_count_kv': Array.from({ length: 8 }, () => [8, 8, 8, 8, 8, 1]).flat(),
+  'gemma4.attention.sliding_window_pattern': Array.from({ length: 8 }, () => [
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+  ]).flat(),
+  'gemma4.attention.sliding_window': 1024,
+  'gemma4.attention.key_length': 512,
+  'gemma4.attention.value_length': 512,
+  'gemma4.attention.key_length_swa': 256,
+  'gemma4.attention.value_length_swa': 256,
+  'gemma4.context_length': 262144,
+}
+
+/** The same model as a non-verbose /api/show returns it: the arrays come back null. */
+const GEMMA4_12B_INFO_NON_VERBOSE = {
+  ...GEMMA4_12B_INFO,
+  'gemma4.attention.head_count_kv': null,
+  'gemma4.attention.sliding_window_pattern': null,
+}
+
+test('charges only global layers per token on a sliding-window model (#1446)', () => {
+  // 8 global layers x 1 KV head x 2 (K+V) x 512 x 2 bytes = 16 KiB/token, not
+  // the 1536 KiB the every-layer, head_count fallback produced.
+  assert.equal(computeKvBytesPerToken(GEMMA4_12B_INFO), 16 * KIB)
+  // 40 sliding layers x 8 KV heads x (256 + 256) x 2 bytes x 1024 tokens.
+  assert.deepEqual(computeKvCacheCost(GEMMA4_12B_INFO), {
+    perTokenBytes: 16 * KIB,
+    fixedBytes: 320 * MIB,
+  })
+})
+
+test('a per-layer head_count_kv array is summed per layer without a sliding pattern', () => {
+  const noPattern: Record<string, unknown> = { ...GEMMA4_12B_INFO }
+  delete noPattern['gemma4.attention.sliding_window_pattern']
+  // 2 x (40 x 8 + 8 x 1) heads x 512 x 2 bytes = 656 KiB, all of it per token.
+  assert.deepEqual(computeKvCacheCost(noPattern), { perTokenBytes: 656 * KIB, fixedBytes: 0 })
+})
+
+test('null per-layer arrays degrade to the pessimistic estimate and ask for verbose info', () => {
+  // Falls back to head_count on every layer: overstated, but never understated.
+  assert.equal(computeKvBytesPerToken(GEMMA4_12B_INFO_NON_VERBOSE), 1536 * KIB)
+  assert.equal(computeKvCacheCost(GEMMA4_12B_INFO_NON_VERBOSE)!.fixedBytes, 0)
+  assert.equal(needsVerboseModelInfo(GEMMA4_12B_INFO_NON_VERBOSE), true)
+  assert.equal(needsVerboseModelInfo(GEMMA4_12B_INFO), false)
+  // Models without these keys never pay for the (large) verbose response.
+  assert.equal(needsVerboseModelInfo(LLAMA3_8B_INFO), false)
+  assert.equal(needsVerboseModelInfo(undefined), false)
+})
+
+test('models without sliding-window metadata have no fixed KV cost', () => {
+  assert.deepEqual(computeKvCacheCost(LLAMA3_8B_INFO), { perTokenBytes: 128 * KIB, fixedBytes: 0 })
+})
+
+test('gemma4:12b on a 12 GB GPU gets a real window, not the floor (#1446)', () => {
+  // The pool NOMAD derived in the issue: ~2007 tokens x 1536 KiB ≈ 2.9 GiB for KV.
+  const forKv = 2007 * 1536 * KIB
+  const common = {
+    modelMaxCtx: 262144,
+    availableBytes: 12 * GB,
+    modelBytes: 12 * GB * 0.8 - forKv,
+  }
+  const before = resolveContextWindow({ ...common, kvBytesPerToken: 1536 * KIB })
+  assert.equal(before.contextWindow, MIN_CONTEXT)
+  assert.equal(before.limitedBy, 'floor')
+
+  const cost = computeKvCacheCost(GEMMA4_12B_INFO)!
+  const after = resolveContextWindow({
+    ...common,
+    kvBytesPerToken: cost.perTokenBytes,
+    kvFixedBytes: cost.fixedBytes,
+  })
+  assert.ok(after.contextWindow >= 32768)
+  assert.equal(after.contextWindow, 131072)
+  assert.equal(after.limitedBy, 'memory')
+  // (2.9 GiB - 320 MiB) / 16 KiB ≈ 172K, as the issue works out.
+  assert.equal(after.affordableTokens, Math.floor((forKv - 320 * MIB) / (16 * KIB)))
+})
+
+test('the fixed KV cost comes out of the pool before dividing', () => {
+  const inputs = { modelMaxCtx: 131072, kvBytesPerToken: 128 * KIB, availableBytes: 8 * GB }
+  const without = resolveContextWindow(inputs)
+  const withFixed = resolveContextWindow({ ...inputs, kvFixedBytes: 1 * GB })
+  assert.equal(without.affordableTokens! - withFixed.affordableTokens!, GB / (128 * KIB))
 })
 
 test('KV estimate falls back by parameter size, monotonically', () => {

@@ -6,8 +6,9 @@ import { OllamaService } from '#services/ollama_service'
 import { SystemService } from '#services/system_service'
 import {
   UNKNOWN_BACKEND_CONTEXT,
-  computeKvBytesPerToken,
+  computeKvCacheCost,
   estimateKvBytesPerToken,
+  needsVerboseModelInfo,
   parseParameterBillions,
   parseUserContextCap,
   resolveContextWindow,
@@ -85,14 +86,27 @@ export class ContextWindowService {
       return decision
     }
 
+    // The shared /api/show read is non-verbose, which nulls the per-layer arrays
+    // Gemma 4 needs for an honest KV cost (#1446). Only for such models, ask once
+    // more verbosely; this decision is memoized, so it is one extra call per
+    // model per process. If it fails, the plain blob still yields a (pessimistic)
+    // estimate.
+    let rawModelInfo = info.rawModelInfo
+    if (needsVerboseModelInfo(rawModelInfo)) {
+      rawModelInfo = (await this.ollamaService.getVerboseModelInfo(model)) ?? rawModelInfo
+    }
+
+    const kvCost = computeKvCacheCost(rawModelInfo)
     const kvBytesPerToken =
-      computeKvBytesPerToken(info.rawModelInfo) ??
+      kvCost?.perTokenBytes ??
       estimateKvBytesPerToken(parseParameterBillions(info.parameterSize, model))
+    const kvFixedBytes = kvCost?.fixedBytes ?? 0
 
     const decision = resolveContextWindow({
       modelMaxCtx: info.contextLength,
       modelfileNumCtx: info.modelfileNumCtx,
       kvBytesPerToken,
+      kvFixedBytes,
       availableBytes: await this._availableBytes(),
       modelBytes: await this._modelBytes(model),
       userCap,
@@ -101,6 +115,7 @@ export class ContextWindowService {
     logger.info(
       `[ContextWindow] ${model}: ${decision.contextWindow} tokens (limited by ${decision.limitedBy}; ` +
         `${(kvBytesPerToken / 1024).toFixed(0)} KiB/token KV` +
+        `${kvFixedBytes > 0 ? ` + ${(kvFixedBytes / 2 ** 20).toFixed(0)} MiB sliding-window` : ''}` +
         `${decision.affordableTokens !== undefined ? `, ~${decision.affordableTokens} affordable` : ''})`
     )
     return decision

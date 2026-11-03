@@ -920,6 +920,32 @@ export class OllamaService {
     }
   }
 
+  /**
+   * The full `model_info` blob from a verbose /api/show.
+   *
+   * Without `verbose`, Ollama nulls out long arrays such as the per-layer
+   * `attention.head_count_kv` and `attention.sliding_window_pattern` that
+   * interleaved-attention models (Gemma 4) need for an accurate KV-cache cost
+   * (#1446). The verbose response also carries the entire tokenizer vocabulary,
+   * so this is deliberately not memoized here or used by `getModelInfo`:
+   * ContextWindowService calls it at most once per model, and only when the
+   * plain response came back with those keys nulled.
+   */
+  public async getVerboseModelInfo(modelName: string): Promise<Record<string, any> | undefined> {
+    await this._ensureDependencies()
+    if (!this.baseUrl) return undefined
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/api/show`,
+        { model: modelName, verbose: true },
+        { timeout: 15000 }
+      )
+      return response.data?.model_info ?? undefined
+    } catch {
+      return undefined
+    }
+  }
+
   public async getModelCapabilities(
     modelName: string,
     advertisedMetadata?: unknown
