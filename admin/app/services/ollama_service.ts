@@ -299,9 +299,16 @@ export class OllamaService {
             // A 401/403 is the same: Open WebUI's /ollama passthrough refuses a missing
             // or wrong API key before it ever reaches Ollama (#1434).
             this.nativeProbe = null
-            logger.info(
-              '[OllamaService] Native-API probe could not reach the backend; leaving the backend type undetermined and re-probing on next use.'
-            )
+            if (err.response !== undefined) {
+              logger.warn(
+                `[OllamaService] Native-API probe: the backend rejected the credentials (HTTP ${err.response.status}); ` +
+                  'check the API key in Settings > Models. Leaving the backend type undetermined and re-probing on next use.'
+              )
+            } else {
+              logger.info(
+                '[OllamaService] Native-API probe could not reach the backend; leaving the backend type undetermined and re-probing on next use.'
+              )
+            }
             return false
           }
           // The backend answered (non-2xx status, or a 200 with a non-Ollama body via the

@@ -44,6 +44,55 @@ export function remoteAuthHeaders(apiKey: string | null | undefined): Record<str
   return key ? { Authorization: `Bearer ${key}` } : {}
 }
 
+export type StoredApiKeyDecision =
+  | { action: 'keep' }
+  | { action: 'set'; key: string }
+  | { action: 'clear'; reason: 'explicit' | 'origin-changed' }
+
+function urlOrigin(url: string | null | undefined): string | null {
+  if (typeof url !== 'string' || url.trim() === '') return null
+  try {
+    const origin = new URL(url.trim()).origin
+    // Non-special schemes report the opaque origin "null"; treat as unparseable.
+    return origin === 'null' ? null : origin
+  } catch {
+    return null
+  }
+}
+
+/**
+ * What to do with the saved API key when the remote URL is saved (#1434).
+ *
+ * `apiKeyInput` is the request's `apiKey` field, `undefined` when it was left
+ * out. An explicit value always wins: a key replaces the saved one, '' or null
+ * removes it. When it is left out the saved key is kept only if the new URL has
+ * the same origin (scheme, host, port) as the URL the key was saved for, so a
+ * key for one server is never sent to another just because the address field
+ * changed. A different path on the same server (adding Open WebUI's /ollama)
+ * keeps it. If either URL cannot be parsed we cannot prove it is the same
+ * server, so the key is dropped.
+ *
+ * Throws (via normalizeRemoteApiKey) on a malformed explicit key.
+ */
+export function decideStoredApiKey({
+  oldUrl,
+  newUrl,
+  apiKeyInput,
+}: {
+  oldUrl: string | null | undefined
+  newUrl: string
+  apiKeyInput: unknown
+}): StoredApiKeyDecision {
+  if (apiKeyInput !== undefined) {
+    const key = normalizeRemoteApiKey(apiKeyInput)
+    return key ? { action: 'set', key } : { action: 'clear', reason: 'explicit' }
+  }
+  const before = urlOrigin(oldUrl)
+  const after = urlOrigin(newUrl)
+  if (before !== null && before === after) return { action: 'keep' }
+  return { action: 'clear', reason: 'origin-changed' }
+}
+
 /**
  * Append an API path to a backend base URL, keeping any path prefix the base
  * already has. `new URL('/api/tags', base)` resolves against the origin and

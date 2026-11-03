@@ -12,9 +12,10 @@ import { assertNotCloudMetadataUrl } from '#validators/common'
 import {
   describeRemoteConnectionFailure,
   describeRemoteHttpFailure,
+  decideStoredApiKey,
   joinBackendUrl,
-  normalizeRemoteApiKey,
   remoteAuthHeaders,
+  type StoredApiKeyDecision,
 } from '../utils/remote_ai_backend.js'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
@@ -448,24 +449,42 @@ export default class OllamaController {
       })
     }
 
-    // Optional API key (#1434), e.g. for Open WebUI's /ollama passthrough. Three
-    // states, so the browser never needs the stored key back: `apiKey` absent keeps
-    // whatever is stored (the form shows only "set"/"not set"), an empty string or
-    // null clears it, and anything else replaces it.
-    const apiKeyProvided = Object.prototype.hasOwnProperty.call(request.all(), 'apiKey')
-    let apiKey: string | null
-    if (apiKeyProvided) {
-      try {
-        apiKey = normalizeRemoteApiKey(request.input('apiKey', null))
-      } catch (err) {
-        return response.status(400).send({
-          success: false,
-          message: err instanceof Error ? err.message : 'Invalid API key.',
-        })
-      }
-    } else {
-      apiKey = await KVStore.getValue('ai.remoteOllamaApiKey')
+    // Optional API key (#1434), e.g. for Open WebUI's /ollama passthrough. The
+    // browser never gets the stored key back: `apiKey` absent keeps whatever is
+    // stored (the form shows only "set"/"not set"), an empty string or null clears
+    // it, and anything else replaces it. An absent key is also dropped when the
+    // URL now points at a different server (see decideStoredApiKey).
+    const body = request.all()
+    const [oldUrl, storedApiKey] = await Promise.all([
+      KVStore.getValue('ai.remoteOllamaUrl'),
+      KVStore.getValue('ai.remoteOllamaApiKey'),
+    ])
+    let keyDecision: StoredApiKeyDecision
+    try {
+      keyDecision = decideStoredApiKey({
+        oldUrl,
+        newUrl: remoteUrl,
+        apiKeyInput: Object.prototype.hasOwnProperty.call(body, 'apiKey')
+          ? (body.apiKey ?? null)
+          : undefined,
+      })
+    } catch (err) {
+      return response.status(400).send({
+        success: false,
+        message: err instanceof Error ? err.message : 'Invalid API key.',
+      })
     }
+    const apiKey =
+      keyDecision.action === 'set'
+        ? keyDecision.key
+        : keyDecision.action === 'keep'
+          ? storedApiKey
+          : null
+    const droppedForNewServer =
+      keyDecision.action === 'clear' && keyDecision.reason === 'origin-changed' && !!storedApiKey
+    const droppedKeyNote = droppedForNewServer
+      ? ' The saved API key was removed because the server address changed; enter it again if this server needs one.'
+      : ''
 
     // Test connectivity via OpenAI-compatible /v1/models endpoint (works with Ollama, LM Studio, llama.cpp, etc.)
     try {
@@ -473,7 +492,8 @@ export default class OllamaController {
       if (!testResponse.ok) {
         return response.status(400).send({
           success: false,
-          message: describeRemoteHttpFailure(remoteUrl, testResponse.status, !!apiKey),
+          message:
+            describeRemoteHttpFailure(remoteUrl, testResponse.status, !!apiKey) + droppedKeyNote,
         })
       }
     } catch (error) {
@@ -486,12 +506,10 @@ export default class OllamaController {
 
     // Save remote URL and mark service as installed
     await KVStore.setValue('ai.remoteOllamaUrl', remoteUrl.trim())
-    if (apiKeyProvided) {
-      if (apiKey) {
-        await KVStore.setValue('ai.remoteOllamaApiKey', apiKey)
-      } else {
-        await KVStore.clearValue('ai.remoteOllamaApiKey')
-      }
+    if (keyDecision.action === 'set') {
+      await KVStore.setValue('ai.remoteOllamaApiKey', keyDecision.key)
+    } else if (keyDecision.action === 'clear') {
+      await KVStore.clearValue('ai.remoteOllamaApiKey')
     }
     ollamaService.installed = true
     ollamaService.installation_status = 'idle'
@@ -515,7 +533,7 @@ export default class OllamaController {
       logger.error('[OllamaController] Failed to discover Nomad docs:', error)
     })
 
-    return { success: true, message: 'Remote Ollama configured.' }
+    return { success: true, message: `Remote Ollama configured.${droppedKeyNote}` }
   }
 
   /**
