@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from 'react'
 
 import api from '~/lib/api'
-import type { MapMarkerResponse } from '../../types/maps'
+import type { MapMarkerLayerResponse, MapMarkerResponse } from '../../types/maps'
 
 export const PIN_COLORS = [
   { id: 'orange', label: 'Orange', hex: '#a84a12' },
@@ -28,8 +28,16 @@ export interface MapMarker {
   iconColor?: string | null
   visible: boolean
   notes?: string | null
+  layerId: number | null
   createdAt: string
   updatedAt?: string
+}
+
+/** A named group of pins (#1387). */
+export interface MapMarkerLayer {
+  id: number
+  name: string
+  visible: boolean
 }
 
 type CreateMapMarkerValues = {
@@ -42,6 +50,7 @@ type CreateMapMarkerValues = {
   iconColor?: string | null
   visible?: boolean
   notes?: string | null
+  layerId?: number | null
 }
 
 type UpdateMapMarkerValues = {
@@ -52,6 +61,7 @@ type UpdateMapMarkerValues = {
   iconColor?: string | null
   visible?: boolean
   notes?: string | null
+  layerId?: number
 }
 
 const mapMarkerResponse = (marker: MapMarkerResponse): MapMarker => ({
@@ -65,24 +75,38 @@ const mapMarkerResponse = (marker: MapMarkerResponse): MapMarker => ({
   iconColor: marker.icon_color ?? null,
   visible: marker.visible ?? true,
   notes: marker.notes ?? null,
+  layerId: marker.layer_id ?? null,
   createdAt: marker.created_at,
   updatedAt: marker.updated_at,
 })
 
+const mapLayerResponse = (layer: MapMarkerLayerResponse): MapMarkerLayer => ({
+  id: layer.id,
+  name: layer.name,
+  visible: Boolean(layer.visible),
+})
+
 export function useMapMarkers() {
   const [markers, setMarkers] = useState<MapMarker[]>([])
+  const [layers, setLayers] = useState<MapMarkerLayer[]>([])
   const [loaded, setLoaded] = useState(false)
+
+  // Pins and layers load together; an import adds both, so it reloads both.
+  const reload = useCallback(async () => {
+    const [markerData, layerData] = await Promise.all([
+      api.listMapMarkers(),
+      api.listMapMarkerLayers(),
+    ])
+
+    if (markerData) setMarkers(markerData.map(mapMarkerResponse))
+    if (layerData) setLayers(layerData.map(mapLayerResponse))
+    setLoaded(true)
+  }, [])
 
   // Load markers from API on mount
   useEffect(() => {
-    api.listMapMarkers().then((data) => {
-      if (data) {
-        setMarkers(data.map(mapMarkerResponse))
-      }
-
-      setLoaded(true)
-    })
-  }, [])
+    reload()
+  }, [reload])
 
   const addMarker = useCallback(async (values: CreateMapMarkerValues) => {
     const result = await api.createMapMarker({
@@ -95,6 +119,7 @@ export function useMapMarkers() {
       icon_color: values.iconColor ?? null,
       visible: values.visible ?? true,
       notes: values.notes ?? null,
+      layer_id: values.layerId ?? null,
     })
 
     if (result) {
@@ -115,6 +140,7 @@ export function useMapMarkers() {
       icon_color: updates.iconColor,
       visible: updates.visible,
       notes: updates.notes,
+      layer_id: updates.layerId,
     })
 
     if (result) {
@@ -135,5 +161,47 @@ export function useMapMarkers() {
     setMarkers((prev) => prev.filter((marker) => marker.id !== id))
   }, [])
 
-  return { markers, loaded, addMarker, updateMarker, deleteMarker }
+  const addLayer = useCallback(async (name: string) => {
+    const result = await api.createMapMarkerLayer(name)
+    if (!result) return null
+
+    const layer = mapLayerResponse(result)
+    setLayers((prev) => [...prev, layer])
+    return layer
+  }, [])
+
+  const updateLayer = useCallback(
+    async (id: number, updates: { name?: string; visible?: boolean }) => {
+      const result = await api.updateMapMarkerLayer(id, updates)
+      if (!result) return null
+
+      const layer = mapLayerResponse(result)
+      setLayers((prev) => prev.map((existing) => (existing.id === id ? layer : existing)))
+      return layer
+    },
+    []
+  )
+
+  // Deleting a layer deletes its pins server-side, so drop them here too.
+  const deleteLayer = useCallback(async (id: number) => {
+    const result = await api.deleteMapMarkerLayer(id)
+    if (!result) return false
+
+    setLayers((prev) => prev.filter((layer) => layer.id !== id))
+    setMarkers((prev) => prev.filter((marker) => marker.layerId !== id))
+    return true
+  }, [])
+
+  return {
+    markers,
+    layers,
+    loaded,
+    reload,
+    addMarker,
+    updateMarker,
+    deleteMarker,
+    addLayer,
+    updateLayer,
+    deleteLayer,
+  }
 }

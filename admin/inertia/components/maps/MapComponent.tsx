@@ -13,6 +13,7 @@ import { Protocol } from 'pmtiles'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useMapMarkers } from '~/hooks/useMapMarkers'
+import { effectiveLayerId, isMarkerShown } from '~/lib/map_marker_layers'
 
 import MarkerPin from './MarkerPin'
 import MarkerPanel from './MarkerPanel'
@@ -139,7 +140,24 @@ export default function MapComponent({
   const animationFrameRef = useRef<number | null>(null)
   const handledMapCommandIdRef = useRef<number | null>(null)
 
-  const { markers, addMarker, updateMarker, deleteMarker } = useMapMarkers()
+  const {
+    markers,
+    layers,
+    reload: reloadMarkers,
+    addMarker,
+    updateMarker,
+    deleteMarker,
+    addLayer,
+    updateLayer,
+    deleteLayer,
+  } = useMapMarkers()
+
+  // The layer a newly dropped pin goes into (#1387). Falls back to the default
+  // (oldest) layer until the user picks one, or if the picked one is deleted.
+  const [chosenLayerId, setChosenLayerId] = useState<number | null>(null)
+  const activeLayerId = layers.some((layer) => layer.id === chosenLayerId)
+    ? chosenLayerId
+    : effectiveLayerId({ layerId: null }, layers)
 
   const [targetIndicator, setTargetIndicator] = useState<{ lng: number; lat: number } | null>(null)
   const [isDraggingMap, setIsDraggingMap] = useState(false)
@@ -262,11 +280,12 @@ export default function MapComponent({
 
     const marker = markers.find((existingMarker) => existingMarker.id === selectedMarkerId)
 
-    if (!marker || marker.visible === false) {
+    // Hiding the pin's layer closes its popup just like hiding the pin itself.
+    if (!marker || !isMarkerShown(marker, layers)) {
       setSelectedMarkerId(null)
       setEditingMarkerId(null)
     }
-  }, [markers, selectedMarkerId])
+  }, [markers, layers, selectedMarkerId])
 
   const handleScaleUnitChange = useCallback((unit: ScaleUnit) => {
     setScaleUnit(unit)
@@ -435,7 +454,7 @@ export default function MapComponent({
           />
 
           {markers
-            .filter((marker) => marker.visible)
+            .filter((marker) => isMarkerShown(marker, layers))
             .map((marker) => (
               <Marker
                 key={marker.id}
@@ -469,9 +488,11 @@ export default function MapComponent({
             <MapMarkerFormPopup
               longitude={placingMarker.lng}
               latitude={placingMarker.lat}
+              layers={layers}
+              initialLayerId={activeLayerId}
               onDirtyChange={setHasUnsavedMarkerChanges}
               onMouseEnter={hideCoordinates}
-              onSave={async ({ name, notes, color, customColor, icon }) => {
+              onSave={async ({ name, notes, color, customColor, icon, layerId }) => {
                 const saved = await addMarker({
                   name,
                   longitude: placingMarker.lng,
@@ -480,12 +501,18 @@ export default function MapComponent({
                   customColor,
                   icon,
                   notes: notes || null,
+                  layerId,
                 })
 
                 // Leave the popup open on failure. api.ts already surfaces the
                 // error toast, but closing here would throw away what was typed
                 // with nothing to retry against.
                 if (!saved) return
+
+                // Dropping a pin into a hidden layer would make it vanish the
+                // moment it is saved; show the layer instead.
+                const savedLayer = layers.find((layer) => layer.id === saved.layerId)
+                if (savedLayer && !savedLayer.visible) updateLayer(savedLayer.id, { visible: true })
 
                 setPlacingMarker(null)
                 setHasUnsavedMarkerChanges(false)
@@ -516,9 +543,11 @@ export default function MapComponent({
               longitude={selectedMarker.longitude}
               latitude={selectedMarker.latitude}
               initialMarker={selectedMarker}
+              layers={layers}
+              initialLayerId={effectiveLayerId(selectedMarker, layers)}
               onDirtyChange={setHasUnsavedMarkerChanges}
               onMouseEnter={hideCoordinates}
-              onSave={async ({ id, name, notes, color, customColor, icon }) => {
+              onSave={async ({ id, name, notes, color, customColor, icon, layerId }) => {
                 if (!id) return
 
                 const saved = await updateMarker(id, {
@@ -527,6 +556,7 @@ export default function MapComponent({
                   color,
                   customColor,
                   icon,
+                  layerId: layerId ?? undefined,
                 })
 
                 if (!saved) return
@@ -553,6 +583,18 @@ export default function MapComponent({
           onSelect={setSelectedMarkerId}
           selectedMarkerId={selectedMarkerId}
           onToggleVisibility={(id, visible) => updateMarker(id, { visible })}
+          layers={layers}
+          activeLayerId={activeLayerId}
+          onSelectActiveLayer={setChosenLayerId}
+          onToggleLayerVisibility={(id, visible) => updateLayer(id, { visible })}
+          onCreateLayer={async (name) => {
+            // A layer you just made is the one you're about to fill.
+            const layer = await addLayer(name)
+            if (layer) setChosenLayerId(layer.id)
+          }}
+          onRenameLayer={(id, name) => updateLayer(id, { name })}
+          onDeleteLayer={deleteLayer}
+          onLayersImported={reloadMarkers}
         />
       </div>
     </MapProvider>

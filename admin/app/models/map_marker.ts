@@ -31,6 +31,11 @@ export default class MapMarker extends BaseModel {
   @column()
   declare route_order: number | null
 
+  // The MapMarkerLayer this pin belongs to (#1387). Nullable in the schema only
+  // so the upgrade migration can't fail; the controller always sets it.
+  @column()
+  declare layer_id: number | null
+
   // Optional user notes for a location
   @column()
   declare notes: string | null

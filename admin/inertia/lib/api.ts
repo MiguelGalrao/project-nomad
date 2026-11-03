@@ -15,7 +15,14 @@ import { catchInternal } from './util'
 import { NomadChatResponse, NomadInstalledModel, NomadOllamaModel, OllamaChatRequest } from '../../types/ollama'
 import BenchmarkResult from '#models/benchmark_result'
 import { BenchmarkType, RunBenchmarkResponse, SubmitBenchmarkResponse, UpdateBuilderTagResponse } from '../../types/benchmark'
-import type { CreateMapMarkerPayload, MapMarkerResponse, UpdateMapMarkerPayload } from '../../types/maps'
+import type {
+  CreateMapMarkerPayload,
+  ImportMapMarkerLayersPayload,
+  ImportMapMarkerLayersResponse,
+  MapMarkerLayerResponse,
+  MapMarkerResponse,
+  UpdateMapMarkerPayload,
+} from '../../types/maps'
 import type { ChatSource } from '../../types/chat'
 import { chatStreamErrorMessage } from './chat_stream.js'
 
@@ -837,6 +844,68 @@ class API {
     return catchInternal(async () => {
       await this.client.delete(`/maps/markers/${id}`)
     })()
+  }
+
+  async listMapMarkerLayers() {
+    return catchInternal(async () => {
+      const response = await this.client.get<MapMarkerLayerResponse[]>('/maps/marker-layers')
+      return response.data
+    })()
+  }
+
+  async createMapMarkerLayer(name: string) {
+    return catchInternal(async () => {
+      const response = await this.client.post<MapMarkerLayerResponse>('/maps/marker-layers', {
+        name,
+      })
+      return response.data
+    })()
+  }
+
+  async updateMapMarkerLayer(id: number, data: { name?: string; visible?: boolean }) {
+    return catchInternal(async () => {
+      const response = await this.client.patch<MapMarkerLayerResponse>(
+        `/maps/marker-layers/${id}`,
+        data
+      )
+      return response.data
+    })()
+  }
+
+  async deleteMapMarkerLayer(id: number) {
+    return catchInternal(async () => {
+      const response = await this.client.delete<{ message: string; deleted_pins: number }>(
+        `/maps/marker-layers/${id}`
+      )
+      return response.data
+    })()
+  }
+
+  /** Where the browser downloads a layer export from (all layers when id is omitted). */
+  mapMarkerLayerExportUrl(layerId?: number) {
+    return `/api/maps/marker-layers/export${layerId ? `?layer_id=${layerId}` : ''}`
+  }
+
+  /**
+   * Not wrapped in catchInternal: an invalid file is an expected outcome, and
+   * the server's 422 message ("Invalid pin file at layers.0.pins.3.latitude...")
+   * is what the user needs to see, not the generic internal-error toast.
+   */
+  async importMapMarkerLayers(
+    data: ImportMapMarkerLayersPayload
+  ): Promise<{ ok: true; data: ImportMapMarkerLayersResponse } | { ok: false; message: string }> {
+    try {
+      const response = await this.client.post<ImportMapMarkerLayersResponse>(
+        '/maps/marker-layers/import',
+        data
+      )
+      return { ok: true, data: response.data }
+    } catch (error) {
+      if (error instanceof AxiosError && error.response?.data?.message) {
+        return { ok: false, message: error.response.data.message }
+      }
+      return { ok: false, message: 'The import failed. Please check the file and try again.' }
+    }
   }
 
   async listRemoteZimFiles({

@@ -66,6 +66,7 @@ export type CreateMapMarkerPayload = {
   icon?: string | null
   icon_color?: string | null
   visible?: boolean
+  layer_id?: number | null
 }
 
 export type UpdateMapMarkerPayload = Partial<CreateMapMarkerPayload>
@@ -81,6 +82,30 @@ export type MapMarkerResponse = {
   icon_color?: string | null
   visible?: boolean
   notes?: string | null
+  layer_id?: number | null
   created_at: string
   updated_at?: string
+}
+
+/** A named group of pins (#1387); not a MapLibre style layer. */
+export type MapMarkerLayerResponse = {
+  id: number
+  name: string
+  visible: boolean
+  created_at: string
+  updated_at?: string
+}
+
+export type ImportMapMarkerLayersPayload = {
+  mode: 'new' | 'merge' | 'replace'
+  target_layer_id?: number
+  /** The parsed NOMAD JSON export; validated server-side. */
+  file: unknown
+}
+
+export type ImportMapMarkerLayersResponse = {
+  message: string
+  imported_pins: number
+  imported_routes: number
+  skipped_duplicates: number
 }

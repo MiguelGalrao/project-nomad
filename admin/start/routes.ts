@@ -40,6 +40,10 @@ import {
   applyAllContentUpdatesValidator,
   mapExtractPreflightValidator,
   mapExtractValidator,
+  createMarkerLayerValidator,
+  updateMarkerLayerValidator,
+  exportMarkerLayersQueryValidator,
+  importMarkerLayersValidator,
 } from '#validators/common'
 import {
   listRemoteZimValidator,
@@ -244,6 +248,34 @@ router
     })
     documented(router.delete('/markers/:id', [MapsController, 'deleteMarker']), {
       summary: 'Delete a map marker',
+      tags: ['maps'],
+    })
+    documented(router.get('/marker-layers', [MapsController, 'listMarkerLayers']), {
+      summary: 'List map pin layers',
+      tags: ['maps'],
+    })
+    documented(router.post('/marker-layers', [MapsController, 'createMarkerLayer']), {
+      summary: 'Create a map pin layer',
+      tags: ['maps'],
+      request: createMarkerLayerValidator,
+    })
+    documented(router.get('/marker-layers/export', [MapsController, 'exportMarkerLayers']), {
+      summary: 'Export one or all pin layers as a NOMAD JSON file',
+      tags: ['maps'],
+      query: exportMarkerLayersQueryValidator,
+    })
+    documented(router.post('/marker-layers/import', [MapsController, 'importMarkerLayers']), {
+      summary: 'Import a NOMAD JSON pin file as a new layer, or merge into / replace a layer',
+      tags: ['maps'],
+      request: importMarkerLayersValidator,
+    })
+    documented(router.patch('/marker-layers/:id', [MapsController, 'updateMarkerLayer']), {
+      summary: 'Rename a map pin layer or toggle its visibility',
+      tags: ['maps'],
+      request: updateMarkerLayerValidator,
+    })
+    documented(router.delete('/marker-layers/:id', [MapsController, 'deleteMarkerLayer']), {
+      summary: 'Delete a map pin layer and its pins',
       tags: ['maps'],
     })
     documented(router.delete('/:filename', [MapsController, 'delete']), {

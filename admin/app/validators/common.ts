@@ -1,5 +1,9 @@
 import vine from '@vinejs/vine'
 import ipaddr from 'ipaddr.js'
+import {
+  MARKER_IMPORT_MODES,
+  MARKER_LAYER_NAME_MAX_LENGTH,
+} from '../../constants/map_marker_layers.js'
 
 /**
  * Checks whether a URL points to a loopback or link-local address.
@@ -217,5 +221,44 @@ export const mapExtractValidator = vine.compile(
     maxzoom: vine.number().min(0).max(15).optional(),
     label: vine.string().trim().minLength(1).maxLength(64).optional(),
     estimatedBytes: vine.number().min(0).optional(),
+  })
+)
+
+// --- Map pin layers (#1387) ---
+
+const markerLayerNameSchema = vine
+  .string()
+  .trim()
+  .minLength(1)
+  .maxLength(MARKER_LAYER_NAME_MAX_LENGTH)
+
+export const createMarkerLayerValidator = vine.compile(
+  vine.object({
+    name: markerLayerNameSchema.clone(),
+  })
+)
+
+export const updateMarkerLayerValidator = vine.compile(
+  vine.object({
+    name: markerLayerNameSchema.clone().optional(),
+    visible: vine.boolean().optional(),
+  })
+)
+
+export const exportMarkerLayersQueryValidator = vine.compile(
+  vine.object({
+    // Omitted = every layer in one file.
+    layer_id: vine.number().withoutDecimals().positive().optional(),
+  })
+)
+
+export const importMarkerLayersValidator = vine.compile(
+  vine.object({
+    mode: vine.enum(MARKER_IMPORT_MODES),
+    // Required for merge/replace; the controller checks it names a real layer.
+    target_layer_id: vine.number({ strict: true }).withoutDecimals().positive().optional(),
+    // The export file itself. Checked by parseMarkerImport (app/utils/map_marker_layers.ts)
+    // so a bad file is reported as "this file is invalid" rather than a request error.
+    file: vine.any(),
   })
 )

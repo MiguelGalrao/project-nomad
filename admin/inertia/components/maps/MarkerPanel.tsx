@@ -10,7 +10,10 @@ import {
 } from '@tabler/icons-react'
 
 import { PIN_COLORS } from '~/hooks/useMapMarkers'
-import type { MapMarker } from '~/hooks/useMapMarkers'
+import type { MapMarker, MapMarkerLayer } from '~/hooks/useMapMarkers'
+import { countPinsByLayer, isMarkerInVisibleLayer } from '~/lib/map_marker_layers'
+
+import MarkerLayersSection from './MarkerLayersSection'
 
 interface MarkerPanelProps {
   markers: MapMarker[]
@@ -19,6 +22,14 @@ interface MarkerPanelProps {
   onSelect: (id: number | null) => void
   onToggleVisibility: (id: number, visible: boolean) => void
   selectedMarkerId: number | null
+  layers: MapMarkerLayer[]
+  activeLayerId: number | null
+  onSelectActiveLayer: (id: number) => void
+  onToggleLayerVisibility: (id: number, visible: boolean) => void
+  onCreateLayer: (name: string) => Promise<unknown>
+  onRenameLayer: (id: number, name: string) => Promise<unknown>
+  onDeleteLayer: (id: number) => Promise<unknown>
+  onLayersImported: () => void
 }
 
 type SortField = 'name' | 'color' | 'visibility' | 'icon'
@@ -81,6 +92,14 @@ export default function MarkerPanel({
                                       onSelect,
                                       onToggleVisibility,
                                       selectedMarkerId,
+                                      layers,
+                                      activeLayerId,
+                                      onSelectActiveLayer,
+                                      onToggleLayerVisibility,
+                                      onCreateLayer,
+                                      onRenameLayer,
+                                      onDeleteLayer,
+                                      onLayersImported,
                                     }: MarkerPanelProps) {
   const [open, setOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -107,11 +126,16 @@ export default function MarkerPanel({
             ? 'Hidden first'
             : 'Visible first'
 
+  const pinCounts = useMemo(() => countPinsByLayer(markers, layers), [markers, layers])
+
   const filteredAndSortedMarkers = useMemo(() => {
     const query = searchQuery.trim().toLowerCase()
 
     return [...markers]
       .filter((marker) => {
+        // A hidden layer hides its pins from the list too, so "show only the
+        // pins that matter right now" (#1387) applies here as well as on the map.
+        if (!isMarkerInVisibleLayer(marker, layers)) return false
         if (!query) return true
         return marker.name.toLowerCase().includes(query)
       })
@@ -137,7 +161,7 @@ export default function MarkerPanel({
 
         return sortDirection === 'asc' ? result : -result
       })
-  }, [markers, searchQuery, sortField, sortDirection])
+  }, [markers, layers, searchQuery, sortField, sortDirection])
 
   const allFilteredMarkersVisible =
     filteredAndSortedMarkers.length > 0 &&
@@ -276,7 +300,9 @@ export default function MarkerPanel({
   }
 
   return (
-    <div className="absolute left-4 top-[72px] z-40 w-72 rounded-lg border border-border-subtle bg-surface-primary/95 shadow-lg backdrop-blur-sm">
+    // A flex column capped to the viewport, so the pin list (not the page)
+    // scrolls now that the layers list sits above it.
+    <div className="absolute left-4 top-[72px] z-40 flex max-h-[calc(100vh-88px)] w-72 flex-col rounded-lg border border-border-subtle bg-surface-primary/95 shadow-lg backdrop-blur-sm">
       {/* The whole title bar closes the panel, mirroring the "Pins" button that
           opens it -- clicking the title to open but having to find the X to
           close is the kind of asymmetry that makes a panel feel fiddly. The X
@@ -313,6 +339,18 @@ export default function MarkerPanel({
           <IconX size={16} />
         </span>
       </div>
+
+      <MarkerLayersSection
+        layers={layers}
+        pinCounts={pinCounts}
+        activeLayerId={activeLayerId}
+        onSelectActive={onSelectActiveLayer}
+        onToggleVisibility={onToggleLayerVisibility}
+        onCreate={onCreateLayer}
+        onRename={onRenameLayer}
+        onDelete={onDeleteLayer}
+        onImported={onLayersImported}
+      />
 
       <div className="space-y-2 border-b border-border-subtle px-3 py-2">
         <input
@@ -358,7 +396,7 @@ export default function MarkerPanel({
         )}
       </div>
 
-      <div className="max-h-[calc(100vh-244px)] overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto">
         {markers.length === 0 ? (
           <div className="px-3 py-6 text-center">
             <IconMapPinFilled size={24} className="mx-auto mb-2 text-text-muted" />
@@ -366,7 +404,9 @@ export default function MarkerPanel({
           </div>
         ) : filteredAndSortedMarkers.length === 0 ? (
           <div className="px-3 py-6 text-center">
-            <p className="text-sm text-text-muted">No pins match your search.</p>
+            <p className="text-sm text-text-muted">
+              {searchQuery.trim() ? 'No pins match your search.' : 'No pins in the visible layers.'}
+            </p>
           </div>
         ) : (
           <ul>{filteredAndSortedMarkers.map(renderMarkerRow)}</ul>
