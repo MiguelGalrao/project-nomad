@@ -33,6 +33,9 @@ export const HTML_SELECTORS_TO_REMOVE = [
 export const NON_CONTENT_HEADING_PATTERNS = [
     /^see also$/i,
     /^references$/i,
+    // Translated "References" headings, so a non-English page's citation list is
+    // dropped like the English one (#1453)
+    /^(referencias|referências|références|referenzen|riferimenti|referenties|referencje|參考文獻|参考文献|참고 문헌|tài liệu tham khảo|список литературы|referanslar|referensi|المراجع)$/i,
     /^external links$/i,
     /^further reading$/i,
     /^notes$/i,

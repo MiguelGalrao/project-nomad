@@ -7,6 +7,7 @@ import { ExtractZIMChunkingStrategy, ExtractZIMContentOptions, ZIMContentChunk, 
 import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
 import { isValidZimFile } from '../utils/fs.js'
+import { isOtherLanguageSubpage, resolveArchiveLanguageCode } from '../utils/zim_language.js'
 
 export class ZIMExtractionService {
 
@@ -69,8 +70,13 @@ export class ZIMExtractionService {
             const archiveMetadata = this.extractArchiveMetadata(archive)
             logger.info(`[ZIMExtractionService]: Archive metadata - Title: ${archiveMetadata.title}, Language: ${archiveMetadata.language}`)
 
+            // Archives that ship translations as `<Title>/<lang>` subpages (WikEM) would
+            // otherwise embed every language; null disables the filter (#1453).
+            const archiveLanguageCode = resolveArchiveLanguageCode(archiveMetadata.language)
+
             let articlesProcessed = 0
             let articlesSkipped = 0
+            let otherLanguageSkipped = 0
             const processedPaths = new Set<string>()
             const toReturn: ZIMContentChunk[] = []
 
@@ -101,6 +107,16 @@ export class ZIMExtractionService {
                     continue
                 }
                 processedPaths.add(entry.path)
+
+                // Skip translation subpages in a language other than the archive's (#1453).
+                // They still count as consumed: the next batch's startOffset is derived from
+                // articlesProcessed and the offset loop above counts every article entry, so
+                // not counting them here would re-read the overlap on every batch.
+                if (isOtherLanguageSubpage(entry.path, archiveLanguageCode)) {
+                    otherLanguageSkipped++
+                    articlesProcessed++
+                    continue
+                }
 
                 const item = entry.item
                 const blob = item.data
@@ -157,6 +173,9 @@ export class ZIMExtractionService {
                 }
             }
 
+            if (otherLanguageSkipped > 0) {
+                logger.info(`[ZIMExtractionService]: Skipped ${otherLanguageSkipped} entries in other languages (archive language: ${archiveMetadata.language})`)
+            }
             logger.info(`[ZIMExtractionService]: Completed processing ZIM file. Total articles processed: ${articlesProcessed}`)
             logger.debug("Final structured content sample:", toReturn.slice(0, 3).map(c => ({
                 articleTitle: c.articleTitle,
