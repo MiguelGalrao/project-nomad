@@ -1,5 +1,8 @@
 import { RagService } from '#services/rag_service'
+import { DockerService } from '#services/docker_service'
+import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { EmbedFileJob } from '#jobs/embed_file_job'
+import { IndexDocumentTextJob } from '#jobs/index_document_text_job'
 import KbRatioRegistry from '#models/kb_ratio_registry'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
@@ -13,7 +16,10 @@ import { sanitizeCollectionName } from '../../constants/kb_collections.js'
 
 @inject()
 export default class RagController {
-  constructor(private ragService: RagService) { }
+  constructor(
+    private ragService: RagService,
+    private dockerService: DockerService
+  ) { }
 
   public async upload({ request, response }: HttpContext) {
     const uploadedFile = request.file('file')
@@ -32,6 +38,33 @@ export default class RagController {
     await uploadedFile.move(app.makePath(RagService.UPLOADS_STORAGE_PATH), {
       name: fileName,
     })
+
+    // Keyword index (#1182), queued separately from embedding so it also runs
+    // on a NOMAD without Ollama/Qdrant. Best-effort: a failure here must not
+    // fail the upload, and the next sync pass backfills the file anyway.
+    try {
+      await IndexDocumentTextJob.dispatchFile(fullPath)
+    } catch (error) {
+      logger.warn({ err: error }, '[RagController] Failed to queue keyword indexing')
+    }
+
+    // Without the AI Assistant the embed job can only fail ("not installed"),
+    // and a failed embed job is a trap: "Clean up failed jobs" deletes its
+    // file. Uploads from the Documents page on a non-AI NOMAD (#1182) skip it;
+    // the file is kept, and a Knowledge Base sync can embed it once AI is installed.
+    // Same two checks EmbedFileJob makes before treating it as unrecoverable.
+    const aiInstalled =
+      !!(await this.dockerService.getServiceURL(SERVICE_NAMES.OLLAMA)) &&
+      !!(await this.dockerService.getServiceURL(SERVICE_NAMES.QDRANT))
+    if (!aiInstalled) {
+      return response.status(202).json({
+        message: 'File uploaded. It will be keyword-searchable once indexed.',
+        fileName,
+        filePath: `/${RagService.UPLOADS_STORAGE_PATH}/${fileName}`,
+        alreadyProcessing: false,
+        ...(collection ? { collection } : {}),
+      })
+    }
 
     // Dispatch background job for embedding
     const result = await EmbedFileJob.dispatch({

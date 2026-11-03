@@ -10,6 +10,7 @@ import { AppAutoUpdateStatus, AutoUpdateStatus, CheckLatestVersionResult, Conten
 import { DownloadJobWithProgress, WikipediaState } from '../../types/downloads'
 import type { Country, CountryCode, CountryGroup, MapExtractPreflight } from '../../types/maps'
 import { EmbedJobWithProgress, FileWarningsResult, StoredFileInfo } from '../../types/rag'
+import type { KbTextDocument, KbTextSearchResponse } from '../../types/kb_text_search'
 import type { CategoryWithStatus, CollectionWithStatus, ContentUpdateCheckResult, CreatorPackWithStatus, ResourceUpdateInfo } from '../../types/collections'
 import { catchInternal } from './util'
 import { NomadChatResponse, NomadInstalledModel, NomadOllamaModel, OllamaChatRequest } from '../../types/ollama'
@@ -589,6 +590,38 @@ class API {
   async deleteRAGFile(source: string) {
     return catchInternal(async () => {
       const response = await this.client.delete<{ message: string }>('/rag/files', { data: { source } })
+      return response.data
+    })()
+  }
+
+  async listKeywordDocuments() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{ documents: KbTextDocument[] }>('/documents')
+      return response.data.documents
+    })()
+  }
+
+  async searchKeywordDocuments(q: string) {
+    return catchInternal(async () => {
+      const response = await this.client.get<KbTextSearchResponse>('/documents/search', {
+        params: { q },
+      })
+      return response.data
+    })()
+  }
+
+  async rescanKeywordDocuments() {
+    return catchInternal(async () => {
+      const response = await this.client.post<{ message: string }>('/documents/rescan')
+      return response.data
+    })()
+  }
+
+  async deleteKeywordDocument(source: string) {
+    return catchInternal(async () => {
+      const response = await this.client.delete<{ message: string }>('/documents', {
+        data: { source },
+      })
       return response.data
     })()
   }

@@ -814,6 +814,48 @@ export class RagService {
     return fullText
   }
 
+  /**
+   * Extract a document's text for the AI-free keyword index (#1182), reusing
+   * the same extractors as the embedding pipeline but touching neither Ollama
+   * nor Qdrant, so it works on a NOMAD with no AI installed.
+   *
+   * PDFs come back per page (so a keyword hit can name its page); other
+   * formats as a single unpaginated block. Two deliberate differences from
+   * processAndEmbedFile:
+   *   - No OCR fallback. OCR costs minutes of CPU per scanned PDF on the
+   *     low-end hardware this feature exists for, and the embed path already
+   *     pays it when AI is installed; doing it twice isn't worth it here.
+   *   - Images and ZIMs return null (not indexed): images are OCR-only, and
+   *     ZIMs are searchable through Kiwix and far too large to retain.
+   */
+  public async extractTextForKeywordIndex(
+    filepath: string
+  ): Promise<Array<{ page: number | null; text: string }> | null> {
+    const fileType = determineFileType(filepath)
+    if (!['pdf', 'docx', 'epub', 'text'].includes(fileType)) return null
+
+    const fileBuffer = await getFile(filepath, 'buffer')
+    if (!fileBuffer) throw new Error('Failed to read the file.')
+
+    switch (fileType) {
+      case 'pdf': {
+        const parser = new PDFParse({ data: fileBuffer })
+        try {
+          const data = await parser.getText()
+          return data.pages.map((p) => ({ page: p.num, text: p.text }))
+        } finally {
+          await parser.destroy()
+        }
+      }
+      case 'docx':
+        return [{ page: null, text: await this.processDocxFile(fileBuffer) }]
+      case 'epub':
+        return [{ page: null, text: await this.processEPUBFile(fileBuffer) }]
+      default:
+        return [{ page: null, text: await this.processTextFile(fileBuffer) }]
+    }
+  }
+
   private async embedTextAndCleanup(
     extractedText: string,
     filepath: string,
@@ -1956,6 +1998,12 @@ export class RagService {
       // path that no longer exists in storage and try to re-embed nothing.
       await KbIngestState.remove(source)
 
+      // Drop the AI-free keyword index rows too (#1182), or the Documents
+      // search keeps returning a file that no longer exists. Dynamic import:
+      // KbTextSearchService imports this module.
+      const { KbTextSearchService } = await import('#services/kb_text_search_service')
+      await KbTextSearchService.removeFile(source)
+
       return { success: true, message: 'File removed from knowledge base.' }
     } catch (error) {
       logger.error('[RAG] Error deleting file from knowledge base:', error)
@@ -2404,6 +2452,15 @@ export class RagService {
   }> {
     try {
       logger.info('[RAG] Starting knowledge base sync scan')
+
+      // Also reconcile the AI-free keyword index (#1182). Queued, not awaited
+      // inline, and independent of Qdrant, which the rest of this scan needs.
+      try {
+        const { IndexDocumentTextJob } = await import('#jobs/index_document_text_job')
+        await IndexDocumentTextJob.dispatchSync()
+      } catch (error) {
+        logger.warn({ err: error }, '[RAG] Failed to queue keyword index sync')
+      }
 
       await this.discoverNomadDocs(true).catch((error) => {
         logger.error('[RAG] Error during Nomad docs discovery in sync process:', error)

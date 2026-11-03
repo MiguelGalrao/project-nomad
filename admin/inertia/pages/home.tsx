@@ -1,6 +1,7 @@
 import {
   IconBolt,
   IconBox,
+  IconFileSearch,
   IconHelp,
   IconMapRoute,
   IconPill,
@@ -51,6 +52,19 @@ const DRUG_REFERENCE_ITEM = {
   icon: <IconPill size={48} />,
   installed: true,
   displayOrder: 5,
+  poweredBy: null,
+}
+
+// Documents: keyword search inside uploaded files (#1182). Always shown,
+// because it is the only document search a NOMAD without the AI Assistant has.
+const DOCUMENTS_ITEM = {
+  label: 'Documents',
+  to: '/documents',
+  target: '',
+  description: 'Upload your own files and search the text inside them',
+  icon: <IconFileSearch size={48} />,
+  installed: true,
+  displayOrder: 6,
   poweredBy: null,
 }
 
@@ -216,6 +230,8 @@ export default function Home(props: {
   if (props.drugReferenceInstalled) {
     items.push(DRUG_REFERENCE_ITEM)
   }
+
+  items.push(DOCUMENTS_ITEM)
 
   // Add system items
   items.push(...SYSTEM_ITEMS)

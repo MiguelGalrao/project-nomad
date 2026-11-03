@@ -10,6 +10,7 @@ import BenchmarkController from '#controllers/benchmark_controller'
 import ChatsController from '#controllers/chats_controller'
 import ConditionsController from '#controllers/conditions_controller'
 import DocsController from '#controllers/docs_controller'
+import DocumentsController from '#controllers/documents_controller'
 import DrugReferenceController from '#controllers/drug_reference_controller'
 import DownloadsController from '#controllers/downloads_controller'
 import EasySetupController from '#controllers/easy_setup_controller'
@@ -92,6 +93,7 @@ import {
 import { updateNomadMdSchema } from '#validators/nomad_md'
 import { searchDrugValidator, interactionsValidator } from '#validators/drug_reference'
 import { conditionDrugsValidator } from '#validators/conditions'
+import { kbTextSearchSchema } from '#validators/kb_text_search'
 
 transmit.registerRoutes()
 
@@ -522,6 +524,33 @@ router
     })
   })
   .prefix('/api/rag')
+
+// Documents — keyword search over knowledge base uploads without AI (#1182).
+// Deliberately outside /chat and /api/rag's AI framing: the page and these
+// endpoints only touch MySQL and kb_uploads, never Ollama or Qdrant.
+router.get('/documents', [DocumentsController, 'index'])
+router
+  .group(() => {
+    documented(router.get('/', [DocumentsController, 'list']), {
+      summary: 'List documents in the keyword index',
+      tags: ['documents'],
+    })
+    documented(router.get('/search', [DocumentsController, 'search']), {
+      summary: 'Keyword search inside uploaded documents',
+      tags: ['documents'],
+      query: kbTextSearchSchema,
+    })
+    documented(router.post('/rescan', [DocumentsController, 'rescan']), {
+      summary: 'Queue a keyword index sync of uploaded documents',
+      tags: ['documents'],
+    })
+    documented(router.delete('/', [DocumentsController, 'destroy']), {
+      summary: 'Delete an uploaded document',
+      tags: ['documents'],
+      query: deleteFileSchema,
+    })
+  })
+  .prefix('/api/documents')
 
 router
   .group(() => {
